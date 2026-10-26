@@ -1,0 +1,4 @@
+[submodule "libs/SSDi8"]
+	path = libs/SSDi8
+	url = /lustre/fast/fast/ntumma/SSDi8-linquant
+	branch = linquant
