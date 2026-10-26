@@ -38,6 +38,8 @@ cd libs/SSDi8 && pip install . --no-build-isolation && cd ../..     # SSDi8 CUDA
 cd csrc/marlin_qqq && python setup.py build_ext --inplace && cd ../..   # Marlin W4A8 GEMM (sm80 / sm86 / sm90)
 ```
 
+nvcc needs a host gcc it supports (CUDA 12.8: gcc <= 13). If your environment's default `gcc` is newer (conda-forge
+ships gcc 14), point the two builds at a system compiler: `CC=/usr/bin/gcc CXX=/usr/bin/g++ python setup.py build_ext --inplace`.
 The SSDi8 build also provides `fast_hadamard_transform`. Model weights and datasets (WikiText-2, Pile-uncopyrighted
 validation shard) are fetched from the Hugging Face Hub.
 
