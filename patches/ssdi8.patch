@@ -1,0 +1,2615 @@
+diff --git a/UPSTREAM_DIVERGENCE.md b/UPSTREAM_DIVERGENCE.md
+new file mode 100644
+index 0000000..3344bd4
+--- /dev/null
++++ b/UPSTREAM_DIVERGENCE.md
+@@ -0,0 +1,81 @@
++# libs/SSDi8 — divergence from upstream
++
++This is a vendored copy of [cau-hai-lab/SSDi8](https://github.com/cau-hai-lab/SSDi8). Audited 2026-04-29.
++
++When auditing baseline-integrity claims (e.g. "we match SSDi8 at 10.92 PPL on Mamba-2 1.3B WT2 / 1727 µs A5000"), this document tells you exactly what differs from upstream and whether it affects baseline numbers.
++
++## Active-by-default divergences (4)
++
++These run on every SSDi8 baseline invocation. Each is required by H100 or by our packaging — none alters the algorithm.
++
++### 1. `csrc/linear/quant_linear_fwd_kernel.cuh` — H100 compile fix
++
++Removed the `__CUDA_ARCH__ < 890` upper bound on `enable_sm80_to_sm89` so the CUTLASS W4A16 forward kernel template instantiates on SM90+. Without this the kernel doesn't compile on H100 and W4A16 paths fail at load.
++
++No effect on Ampere (A5000).
++
++### 2. `ssdi8/megatron_utils.py` — Optional megatron-core import
++
++Wrapped the `MegatronTokenizer` import in `try/except ImportError`. Mamba-2 1.3B / 2.7B don't ship with megatron-core; without this guard, importing `ssdi8` crashes on those models. The 8B path still raises if megatron is actually used.
++
++### 3. `libs/SSDi8/vllm_kernel_patch.py` — *Added file*, not in upstream
++
++Monkey-patches `quant_linear_cuda.w4a8o16_gemm` → vLLM's `marlin_qqq_gemm` extension at import time. This is what makes W4A8 actually work on H100 — upstream's Marlin QQQ kernel has a SHMEM RAW hazard that produces garbage on SM 9.0 (vLLM PR #11493 fixed it in `gptq_marlin` only; vLLM PR #24722 then replaced QQQ entirely). We import the patch at the top of `scripts/eval_ours_modules_in_ssdi8.py` so both the SSDi8 baseline path and our pipeline path use vLLM's working kernel.
++
++**Implication for the baseline number:** the published 10.92 PPL is using vLLM's W4A8 kernel, not upstream SSDi8's. On Ampere this is a no-op (upstream may have been silent there); on H100 it is the difference between working and broken.
++
++**Implication for our pipeline:** LinQuant's `W4A8B16O16Linear` (`linquant/w4a8_linear.py`) also calls `quant_linear_cuda.w4a8o16_gemm`, so the monkey-patch routes our W4A8 GEMM through vLLM's kernel too. SSDi8 baseline and ours pipeline converge on the exact same W4A8 kernel — that's what makes the head-to-head comparison fair.
++
++### 4. `csrc/hadamard/fast_hadamard_transform_common.h` — saturating INT8 store (numerical fix)
++
++`store_output` cast `roundf(x * scale)` straight to `int8_t`. Out of range that cast is undefined: the build the
++LinQuant paper numbers were produced with (nvcc 12.9, no `--use_fast_math`) saturates to ±127, while the
++`setup.py` build (`--use_fast_math`) wraps (e.g. 128 -> -128). The fork clamps to ±127 explicitly, so every
++toolchain reproduces the paper-era behaviour. Affects the out_proj input quantization of every W4A8 row (SSDi8's
++and ours alike). Only entries beyond the calibrated range differ (rare at the calibrated scales); on Mamba-2 1.3B the
++effect on WikiText-2 PPL is below the pipeline's own run-to-run spread (~5e-3, Triton autotuning / cuBLAS).
++
++## Flag-gated divergences (10 files, dormant by default)
++
++These files differ from upstream but only execute non-upstream code paths when research flags are passed. Default arguments preserve upstream behavior bit-for-bit.
++
++| File | Diff | Activates when |
++|---|---|---|
++| `mamba_calib/ops/triton/ssd_combined.py` | `_ROTATION_U` / `_ROTATION_R` module globals + rotate-then-unrotate gate | `_ROTATION_*` set non-None (e.g. `--rotation`) |
++| `ssdi8/modelutils_mamba.py` | Wires every research flag (rotation, scale_percentile, fp16_alog_d, fp_fallback, fq_*, in_proj_a16, out_proj_a16, fp16_*ssd, skip_state_q07) | Any of those flags passed |
++| `ssdi8/qChunkScan.py` | `_FP16_ALOG_D`, `_FP_FALLBACK`, `_FQ_*` module flags + `gramian_b_adjustment` / `value_rotation` kwargs | Corresponding flag set |
++| `ssdi8/qHadamard.py` | Skip INT8 quant when `_OUT_PROJ_A16=True` | `--out_proj_a16` |
++| `ssdi8/qLinearLayer.py` | `W4A16B16O16Linear` class with `_w_ref` + torch.mm fallback | `--in_proj_a16` or `--out_proj_a16` (class is uninstantiated otherwise) |
++| `ssdi8/qMamba2.py` | Conditional W4A16 swap for in/out_proj + U-rotation pre/post around qchunk_scan | Corresponding flag set |
++| `ssdi8/triton/quant_ssd_combined.py` | `_FP16_*` flags, `_SKIP_BC_REQUANT`, `gramian_b_adjustment`/`value_rotation` kwargs, relaxed `q_A_log` dtype assert | Corresponding flag set |
++| `utils.py` | Argparse entries for the flags above | N/A (definitions only) |
++
++## What was reverted on 2026-04-29
++
++These files used to differ but were reverted to upstream during the integrity audit because they were dead code or numerically dormant:
++
++- `csrc/linear/marlin_qqq_gemm_kernel.cuh` — vLLM-port SHMEM-race fix. **Dead code** because `vllm_kernel_patch.py` overrides the function pointer at import time.
++- `csrc/linear/marlin_qqq_gemm_kernel_o8.cuh` — same fix, INT8-output variant. Same dead-code reason.
++- `ssdi8/triton/quant_chunk_state.py` — kernel signature extended per-G → per-(G, N). Wrapper still passed (G,)-shaped scales, so numerically identical to upstream — only added N redundant scale loads. Reverted for cleanliness.
++
++## Auxiliary: research scripts moved out
++
++14 ablation/sweep/profiling scripts that were not part of upstream (`ablation_*.py`, `learn_rotation.py`, `profile_simple.py`, `run_combined_rotation.py`, `run_gramian*.py`, `run_rotation_single.py`, `run_vllm_eval.py`, `run_fp32_statepass.sh`, `sweep_*`) were moved from `libs/SSDi8/` to `scripts/legacy_ssdi8_research/` on 2026-04-29 so the vendored copy reflects upstream layout. None of them affect baseline runs.
++
++## Verdict on baseline numbers
++
++The 10.92 PPL Mamba-2 1.3B WT2 SSDi8 baseline (and 1727 µs A5000 latency) are faithful reproductions of upstream SSDi8 modulo H100-mandatory kernel substitutions:
++
++- **PPL on Ampere:** numerically identical to upstream (vLLM's W4A8 kernel produces the same result as upstream's on SM 8.0; the SM89 guard fix is dormant; megatron try/except is import-only).
++- **PPL on H100:** matches what upstream *would* produce if it compiled and didn't race — i.e. it's the well-defined number.
++- **Latency on A5000:** uses vLLM's marlin_qqq_gemm rather than upstream's — within noise but not exactly upstream.
++
++## Reproducing the audit
++
++```bash
++git clone --depth 1 https://github.com/cau-hai-lab/SSDi8.git /tmp/ssdi8_upstream
++for f in $(diff -rq /tmp/ssdi8_upstream libs/SSDi8 | grep "^Files " | awk '{print $4}'); do
++  echo "=== $f ==="
++  diff -u /tmp/ssdi8_upstream/${f#libs/SSDi8/} $f
++done
++```
+diff --git a/csrc/hadamard/fast_hadamard_transform_common.h b/csrc/hadamard/fast_hadamard_transform_common.h
+index ca21de5..29deaec 100644
+--- a/csrc/hadamard/fast_hadamard_transform_common.h
++++ b/csrc/hadamard/fast_hadamard_transform_common.h
+@@ -4,6 +4,8 @@
+ 
+ #pragma once
+ 
++#include <type_traits>
++
+ #include <cuda_bf16.h>
+ #include <cuda_fp16.h>
+ 
+@@ -150,7 +152,13 @@ inline __device__ void store_output(output_t *out, float out_vals[kNChunks][kNEl
+     #pragma unroll
+     for (int c = 0; c < kNChunks; ++c) {
+         #pragma unroll
+-        for (int i = 0; i < kNElts; ++i) { out_vals_store[c][i] = static_cast<output_t>(roundf(out_vals[c][i] * scale)); }
++        for (int i = 0; i < kNElts; ++i) {
++            float v = roundf(out_vals[c][i] * scale);
++            // Saturate explicitly: a float -> int8 cast is undefined out of range and compiles to either
++            // a saturating or a wrapping conversion depending on the toolchain / flags.
++            if constexpr (std::is_same<output_t, int8_t>::value) { v = fminf(127.f, fmaxf(-127.f, v)); }
++            out_vals_store[c][i] = static_cast<output_t>(v);
++        }
+     }
+     #pragma unroll
+     for (int c = 0; c < kNChunks; ++c) {
+diff --git a/csrc/linear/quant_linear_fwd_kernel.cuh b/csrc/linear/quant_linear_fwd_kernel.cuh
+index 631919c..04e09ec 100644
+--- a/csrc/linear/quant_linear_fwd_kernel.cuh
++++ b/csrc/linear/quant_linear_fwd_kernel.cuh
+@@ -51,7 +51,7 @@ template <typename Kernel>
+ struct enable_sm80_to_sm89 : Kernel {
+   template <typename... Args>
+   CUTLASS_DEVICE static void invoke(Args&&... args) {
+-#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800 && __CUDA_ARCH__ < 890
++#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 800
+     Kernel::invoke(std::forward<Args>(args)...);
+ #endif
+   }
+diff --git a/mamba_calib/ops/triton/ssd_chunk_state.py b/mamba_calib/ops/triton/ssd_chunk_state.py
+index 1f96dfd..6c8da57 100644
+--- a/mamba_calib/ops/triton/ssd_chunk_state.py
++++ b/mamba_calib/ops/triton/ssd_chunk_state.py
+@@ -750,12 +750,19 @@ def _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_f
+     if collect_obs is not None:
+         amax_chp = X_scaled.abs().amax(dim=(0, 2, 1))  # (H,P)
+         if (obs := collect_obs.get("x_chp", None)) is not None:
+-            # 기존 옵저버면 obs.update_amax(...) 하나 추가하세요
+             obs.update_amax(amax_chp)
+             b_bckgn = B.view(batch, nchunks, chunk_size, ngroups, dstate)
+             amax_cgn = b_bckgn.abs().amax(dim=(0, 2 , 1))  # (G,N)
+             if (obs := collect_obs.get("B_cgn", None)) is not None:
+                 obs.update_amax(amax_cgn)
++        if (obs := collect_obs.get("b_gate_hn", None)) is not None:
++            b_bckgn = B.view(batch, nchunks, chunk_size, ngroups, dstate)
++            nheads_per_g = nheads // ngroups
++            group_idx = torch.arange(nheads, device=B.device) // nheads_per_g
++            b_per_head = b_bckgn[:, :, :, group_idx, :]  # (B,C,K,H,N)
++            gated_b = b_per_head * scale_bckh1  # (B,C,K,H,N)
++            amax_hn = gated_b.abs().amax(dim=(0, 1, 2))  # (H,N)
++            obs.update_amax(amax_hn)
+     X_scaled = X_scaled.view(batch, S_total, nheads, headdim)
+     if X_scaled.stride(-1) != 1:
+         X_scaled = X_scaled.contiguous()
+diff --git a/mamba_calib/ops/triton/ssd_combined.py b/mamba_calib/ops/triton/ssd_combined.py
+index eb2f8ed..fdc88d3 100644
+--- a/mamba_calib/ops/triton/ssd_combined.py
++++ b/mamba_calib/ops/triton/ssd_combined.py
+@@ -1,98 +1,201 @@
+ # Copyright (c) 2024, Tri Dao, Albert Gu.
++# ruff: noqa: C901, D101, D102, D103, D200, D205, D210, D212, D300, D301, D400, D401, D404, D415, E501, E731, F811, N802, N803, N806, N812, F841
+ 
+-"""We want triton==2.1.0 or 2.2.0 for this
+-"""
+-
+-from typing import Optional
++"""We want triton==2.1.0 or 2.2.0 for this."""
+ 
+ import math
+-from packaging import version
+ 
+ import torch
+ import torch.nn.functional as F
+-from torch import Tensor
+-from torch.cuda.amp import custom_bwd, custom_fwd
+-
+ import triton
+ import triton.language as tl
+-
+ from einops import rearrange, repeat
++from packaging import version
++from torch.cuda.amp import custom_bwd, custom_fwd
+ 
+ try:
+-    from causal_conv1d import causal_conv1d_fn
+     import causal_conv1d_cuda
++    from causal_conv1d import causal_conv1d_fn
+ except ImportError:
+     causal_conv1d_fn, causal_conv1d_cuda = None, None
+ 
+-from mamba_calib.ops.triton.ssd_bmm import _bmm_chunk_fwd, _bmm_chunk_bwd
+-from mamba_calib.ops.triton.ssd_chunk_state import _chunk_cumsum_fwd, _chunk_cumsum_bwd
+-from mamba_calib.ops.triton.ssd_chunk_state import _chunk_state_fwd, _chunk_state_bwd_db
+-from mamba_calib.ops.triton.ssd_chunk_state import _chunk_state_bwd_ddAcs_stable
+-from mamba_calib.ops.triton.ssd_chunk_state import chunk_state, chunk_state_ref, my_chunk_state_ref
+-from mamba_calib.ops.triton.ssd_chunk_state import chunk_state_varlen
+-from mamba_calib.ops.triton.ssd_state_passing import _state_passing_fwd, _state_passing_bwd
+-from mamba_calib.ops.triton.ssd_state_passing import state_passing, state_passing_ref
+-from mamba_calib.ops.triton.ssd_chunk_scan import _chunk_scan_fwd, _chunk_scan_bwd_dz, _chunk_scan_bwd_dstates
+-from mamba_calib.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_dC, _chunk_scan_bwd_dcb
+-from mamba_calib.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_stable
+-from mamba_calib.ops.triton.ssd_chunk_scan import chunk_scan, chunk_scan_ref, my_chunk_scan_ref
+-from mamba_calib.ops.triton.ssd_chunk_scan import _chunk_scan_bwd_ddAcs_prev
+-from mamba_calib.ops.triton.layernorm_gated import rmsnorm_fn, _layer_norm_fwd, _layer_norm_bwd
+-from mamba_calib.ops.triton.k_activations import _swiglu_fwd, _swiglu_bwd
+-
+-TRITON_22 = version.parse(triton.__version__) >= version.parse('2.2.0')
++from mamba_calib.ops.triton.k_activations import _swiglu_bwd, _swiglu_fwd
++from mamba_calib.ops.triton.layernorm_gated import _layer_norm_bwd, _layer_norm_fwd, rmsnorm_fn
++from mamba_calib.ops.triton.ssd_bmm import _bmm_chunk_bwd, _bmm_chunk_fwd
++from mamba_calib.ops.triton.ssd_chunk_scan import (
++    _chunk_scan_bwd_dC,
++    _chunk_scan_bwd_dcb,
++    _chunk_scan_bwd_ddAcs_stable,
++    _chunk_scan_bwd_dstates,
++    _chunk_scan_bwd_dz,
++    _chunk_scan_fwd,
++    chunk_scan,
++    chunk_scan_ref,
++    my_chunk_scan_ref,
++)
++from mamba_calib.ops.triton.ssd_chunk_state import (
++    _chunk_cumsum_bwd,
++    _chunk_cumsum_fwd,
++    _chunk_state_bwd_db,
++    _chunk_state_fwd,
++    chunk_state,
++    chunk_state_ref,
++    chunk_state_varlen,
++    my_chunk_state_ref,
++)
++from mamba_calib.ops.triton.ssd_state_passing import (
++    _state_passing_bwd,
++    _state_passing_fwd,
++    state_passing,
++    state_passing_ref,
++)
++
++TRITON_22 = version.parse(triton.__version__) >= version.parse("2.2.0")
+ 
+ 
+ def init_to_zero(names):
+     return lambda nargs: [nargs[name].zero_() for name in names if nargs[name] is not None]
+ 
+ 
+-
+ def init_to_zero(names):
+     return lambda nargs: [nargs[name].zero_() for name in names if nargs[name] is not None]
+ 
+ 
+ @triton.autotune(
+     configs=[
+-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 64}, num_stages=3, num_warps=8, pre_hook=init_to_zero(["ddt_ptr"])),
+-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 256, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 128, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+-        triton.Config({'BLOCK_SIZE_M': 128, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 32, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+-        triton.Config({'BLOCK_SIZE_M': 32, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=5, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
+-        triton.Config({'BLOCK_SIZE_M': 64, 'BLOCK_SIZE_N': 64, 'BLOCK_SIZE_K': 32}, num_stages=4, num_warps=4, pre_hook=init_to_zero(["ddt_ptr"])),
++        triton.Config(
++            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 64},
++            num_stages=3,
++            num_warps=8,
++            pre_hook=init_to_zero(["ddt_ptr"]),
++        ),
++        triton.Config(
++            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 256, "BLOCK_SIZE_K": 32},
++            num_stages=4,
++            num_warps=4,
++            pre_hook=init_to_zero(["ddt_ptr"]),
++        ),
++        triton.Config(
++            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
++            num_stages=4,
++            num_warps=4,
++            pre_hook=init_to_zero(["ddt_ptr"]),
++        ),
++        triton.Config(
++            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
++            num_stages=4,
++            num_warps=4,
++            pre_hook=init_to_zero(["ddt_ptr"]),
++        ),
++        triton.Config(
++            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 128, "BLOCK_SIZE_K": 32},
++            num_stages=4,
++            num_warps=4,
++            pre_hook=init_to_zero(["ddt_ptr"]),
++        ),
++        triton.Config(
++            {"BLOCK_SIZE_M": 128, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
++            num_stages=4,
++            num_warps=4,
++            pre_hook=init_to_zero(["ddt_ptr"]),
++        ),
++        triton.Config(
++            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 32, "BLOCK_SIZE_K": 32},
++            num_stages=5,
++            num_warps=4,
++            pre_hook=init_to_zero(["ddt_ptr"]),
++        ),
++        triton.Config(
++            {"BLOCK_SIZE_M": 32, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
++            num_stages=5,
++            num_warps=4,
++            pre_hook=init_to_zero(["ddt_ptr"]),
++        ),
++        triton.Config(
++            {"BLOCK_SIZE_M": 64, "BLOCK_SIZE_N": 64, "BLOCK_SIZE_K": 32},
++            num_stages=4,
++            num_warps=4,
++            pre_hook=init_to_zero(["ddt_ptr"]),
++        ),
+     ],
+-    key=['chunk_size', 'hdim', 'dstate'],
++    key=["chunk_size", "hdim", "dstate"],
+ )
+ @triton.jit
+ def _chunk_scan_chunk_state_bwd_dx_kernel(
+     # Pointers to matrices
+-    x_ptr, cb_ptr, dout_ptr, dt_ptr, dA_cumsum_ptr, seq_idx_ptr, D_ptr,
+-    b_ptr, dstates_ptr,
+-    dx_ptr, ddt_ptr, dD_ptr,
++    x_ptr,
++    cb_ptr,
++    dout_ptr,
++    dt_ptr,
++    dA_cumsum_ptr,
++    seq_idx_ptr,
++    D_ptr,
++    b_ptr,
++    dstates_ptr,
++    dx_ptr,
++    ddt_ptr,
++    dD_ptr,
+     # Matrix dimensions
+-    chunk_size, hdim, dstate,
+-    batch, seqlen, nheads_ngroups_ratio,
++    chunk_size,
++    hdim,
++    dstate,
++    batch,
++    seqlen,
++    nheads_ngroups_ratio,
+     # Strides
+-    stride_x_batch, stride_x_seqlen, stride_x_head, stride_x_hdim,
+-    stride_cb_batch, stride_cb_chunk, stride_cb_head, stride_cb_csize_m, stride_cb_csize_k,
+-    stride_dout_batch, stride_dout_seqlen, stride_dout_head, stride_dout_hdim,
+-    stride_dt_batch, stride_dt_chunk, stride_dt_head, stride_dt_csize,
+-    stride_dA_cs_batch, stride_dA_cs_chunk, stride_dA_cs_head, stride_dA_cs_csize,
+-    stride_seq_idx_batch, stride_seq_idx_seqlen,
++    stride_x_batch,
++    stride_x_seqlen,
++    stride_x_head,
++    stride_x_hdim,
++    stride_cb_batch,
++    stride_cb_chunk,
++    stride_cb_head,
++    stride_cb_csize_m,
++    stride_cb_csize_k,
++    stride_dout_batch,
++    stride_dout_seqlen,
++    stride_dout_head,
++    stride_dout_hdim,
++    stride_dt_batch,
++    stride_dt_chunk,
++    stride_dt_head,
++    stride_dt_csize,
++    stride_dA_cs_batch,
++    stride_dA_cs_chunk,
++    stride_dA_cs_head,
++    stride_dA_cs_csize,
++    stride_seq_idx_batch,
++    stride_seq_idx_seqlen,
+     stride_D_head,
+-    stride_b_batch, stride_b_seqlen, stride_b_head, stride_b_dstate,
+-    stride_dstates_batch, stride_dstates_chunk, stride_dstates_head, stride_dstates_hdim, stride_dstates_dstate,
+-    stride_dx_batch, stride_dx_seqlen, stride_dx_head, stride_dx_hdim,
+-    stride_ddt_batch, stride_ddt_chunk, stride_ddt_head, stride_ddt_csize,
+-    stride_dD_batch, stride_dD_chunk, stride_dD_head, stride_dD_csize, stride_dD_hdim,
++    stride_b_batch,
++    stride_b_seqlen,
++    stride_b_head,
++    stride_b_dstate,
++    stride_dstates_batch,
++    stride_dstates_chunk,
++    stride_dstates_head,
++    stride_dstates_hdim,
++    stride_dstates_dstate,
++    stride_dx_batch,
++    stride_dx_seqlen,
++    stride_dx_head,
++    stride_dx_hdim,
++    stride_ddt_batch,
++    stride_ddt_chunk,
++    stride_ddt_head,
++    stride_ddt_csize,
++    stride_dD_batch,
++    stride_dD_chunk,
++    stride_dD_head,
++    stride_dD_csize,
++    stride_dD_hdim,
+     # Meta-parameters
+     HAS_D: tl.constexpr,
+     D_HAS_HDIM: tl.constexpr,
+     HAS_SEQ_IDX: tl.constexpr,
+-    BLOCK_SIZE_M: tl.constexpr, BLOCK_SIZE_N: tl.constexpr, BLOCK_SIZE_K: tl.constexpr,
++    BLOCK_SIZE_M: tl.constexpr,
++    BLOCK_SIZE_N: tl.constexpr,
++    BLOCK_SIZE_K: tl.constexpr,
+     BLOCK_SIZE_DSTATE: tl.constexpr,
+     IS_TRITON_22: tl.constexpr,
+ ):
+@@ -104,13 +207,29 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
+     pid_m = tl.program_id(axis=0) // num_pid_n
+     pid_n = tl.program_id(axis=0) % num_pid_n
+     x_ptr += pid_b * stride_x_batch + pid_c * chunk_size * stride_x_seqlen + pid_h * stride_x_head
+-    cb_ptr += pid_b * stride_cb_batch + pid_c * stride_cb_chunk + (pid_h // nheads_ngroups_ratio) * stride_cb_head
+-    dout_ptr += pid_b * stride_dout_batch + pid_c * chunk_size * stride_dout_seqlen + pid_h * stride_dout_head
++    cb_ptr += (
++        pid_b * stride_cb_batch
++        + pid_c * stride_cb_chunk
++        + (pid_h // nheads_ngroups_ratio) * stride_cb_head
++    )
++    dout_ptr += (
++        pid_b * stride_dout_batch
++        + pid_c * chunk_size * stride_dout_seqlen
++        + pid_h * stride_dout_head
++    )
+     dt_ptr += pid_b * stride_dt_batch + pid_c * stride_dt_chunk + pid_h * stride_dt_head
+     ddt_ptr += pid_b * stride_ddt_batch + pid_c * stride_ddt_chunk + pid_h * stride_ddt_head
+-    dA_cumsum_ptr += pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
+-    b_ptr += pid_b * stride_b_batch + pid_c * chunk_size * stride_b_seqlen + (pid_h // nheads_ngroups_ratio) * stride_b_head
+-    dstates_ptr += pid_b * stride_dstates_batch + pid_c * stride_dstates_chunk + pid_h * stride_dstates_head
++    dA_cumsum_ptr += (
++        pid_b * stride_dA_cs_batch + pid_c * stride_dA_cs_chunk + pid_h * stride_dA_cs_head
++    )
++    b_ptr += (
++        pid_b * stride_b_batch
++        + pid_c * chunk_size * stride_b_seqlen
++        + (pid_h // nheads_ngroups_ratio) * stride_b_head
++    )
++    dstates_ptr += (
++        pid_b * stride_dstates_batch + pid_c * stride_dstates_chunk + pid_h * stride_dstates_head
++    )
+     if HAS_SEQ_IDX:
+         seq_idx_ptr += pid_b * stride_seq_idx_batch + pid_c * chunk_size * stride_seq_idx_seqlen
+ 
+@@ -121,31 +240,53 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
+ 
+     acc = tl.zeros((BLOCK_SIZE_M, BLOCK_SIZE_N), dtype=tl.float32)
+ 
+-    dA_cs_m = tl.load(dA_cumsum_ptr + offs_m * stride_dA_cs_csize, mask=offs_m < chunk_size_limit, other=0.0).to(tl.float32)
++    dA_cs_m = tl.load(
++        dA_cumsum_ptr + offs_m * stride_dA_cs_csize, mask=offs_m < chunk_size_limit, other=0.0
++    ).to(tl.float32)
+ 
+     dA_cs_last = tl.load(dA_cumsum_ptr + (chunk_size - 1) * stride_dA_cs_csize).to(tl.float32)
+     if not HAS_SEQ_IDX:
+         scale = tl.exp(dA_cs_last - dA_cs_m)
+     else:
+-        seq_idx_m = tl.load(seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1)
++        seq_idx_m = tl.load(
++            seq_idx_ptr + offs_m * stride_seq_idx_seqlen, mask=offs_m < chunk_size_limit, other=-1
++        )
+         seq_idx_last = tl.load(seq_idx_ptr + (chunk_size_limit - 1) * stride_seq_idx_seqlen)
+         scale = tl.where(seq_idx_m == seq_idx_last, tl.exp(dA_cs_last - dA_cs_m), 0.0)
+     # Might be faster to just do 1 iteration with larger BLOCK_SIZE_K, up to block size 128
+     # However, we're getting error with the Triton compiler 2.1.0 for that code path:
+     # Unexpected mma -> mma layout conversion
+     # Triton 2.2.0 fixes this
+-    offs_dstate = tl.arange(0, BLOCK_SIZE_DSTATE if IS_TRITON_22 and BLOCK_SIZE_DSTATE <= 128 else BLOCK_SIZE_K)
++    offs_dstate = tl.arange(
++        0, BLOCK_SIZE_DSTATE if IS_TRITON_22 and BLOCK_SIZE_DSTATE <= 128 else BLOCK_SIZE_K
++    )
+     b_ptrs = b_ptr + (offs_m[:, None] * stride_b_seqlen + offs_dstate[None, :] * stride_b_dstate)
+-    dstates_ptrs = dstates_ptr + (offs_n[None, :] * stride_dstates_hdim + offs_dstate[:, None] * stride_dstates_dstate)
++    dstates_ptrs = dstates_ptr + (
++        offs_n[None, :] * stride_dstates_hdim + offs_dstate[:, None] * stride_dstates_dstate
++    )
+     if IS_TRITON_22 and BLOCK_SIZE_DSTATE <= 128:
+-        b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_dstate[None, :] < dstate), other=0.0)
+-        dstates = tl.load(dstates_ptrs, mask=(offs_dstate[:, None] < dstate) & (offs_n[None, :] < hdim), other=0.0)
++        b = tl.load(
++            b_ptrs,
++            mask=(offs_m[:, None] < chunk_size_limit) & (offs_dstate[None, :] < dstate),
++            other=0.0,
++        )
++        dstates = tl.load(
++            dstates_ptrs, mask=(offs_dstate[:, None] < dstate) & (offs_n[None, :] < hdim), other=0.0
++        )
+         dstates = dstates.to(b_ptr.dtype.element_ty)
+         acc = tl.dot(b, dstates) * scale[:, None]
+     else:
+         for k in range(0, dstate, BLOCK_SIZE_K):
+-            b = tl.load(b_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_dstate[None, :] < dstate - k), other=0.0)
+-            dstates = tl.load(dstates_ptrs, mask=(offs_dstate[:, None] < dstate - k) & (offs_n[None, :] < hdim), other=0.0)
++            b = tl.load(
++                b_ptrs,
++                mask=(offs_m[:, None] < chunk_size_limit) & (offs_dstate[None, :] < dstate - k),
++                other=0.0,
++            )
++            dstates = tl.load(
++                dstates_ptrs,
++                mask=(offs_dstate[:, None] < dstate - k) & (offs_n[None, :] < hdim),
++                other=0.0,
++            )
+             dstates = dstates.to(b_ptr.dtype.element_ty)
+             acc += tl.dot(b, dstates)
+             b_ptrs += BLOCK_SIZE_K * stride_b_dstate
+@@ -162,7 +303,9 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
+ 
+     offs_k = tl.arange(0, BLOCK_SIZE_K)
+     cb_ptrs = cb_ptr + (offs_m[:, None] * stride_cb_csize_m + offs_k[None, :] * stride_cb_csize_k)
+-    dout_ptrs = dout_ptr + (offs_k[:, None] * stride_dout_seqlen + offs_n[None, :] * stride_dout_hdim)
++    dout_ptrs = dout_ptr + (
++        offs_k[:, None] * stride_dout_seqlen + offs_n[None, :] * stride_dout_hdim
++    )
+     dA_cumsum_ptrs = dA_cumsum_ptr + offs_k * stride_dA_cs_csize
+     K_MAX = chunk_size_limit
+     K_MIN = pid_m * BLOCK_SIZE_M
+@@ -172,8 +315,12 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
+     for k in range(K_MIN, K_MAX, BLOCK_SIZE_K):
+         k = tl.multiple_of(k, BLOCK_SIZE_K)
+         # For some reason setting mask to (offs_m[:, None] < chunk_size_limit) is much slower
+-        cb = tl.load(cb_ptrs, mask=(offs_m[:, None] < chunk_size) & (offs_k[None, :] < K_MAX - k), other=0.0)
+-        dout = tl.load(dout_ptrs, mask=(offs_k[:, None] < K_MAX - k) & (offs_n[None, :] < hdim), other=0.0)
++        cb = tl.load(
++            cb_ptrs, mask=(offs_m[:, None] < chunk_size) & (offs_k[None, :] < K_MAX - k), other=0.0
++        )
++        dout = tl.load(
++            dout_ptrs, mask=(offs_k[:, None] < K_MAX - k) & (offs_n[None, :] < hdim), other=0.0
++        )
+         dA_cs_k = tl.load(dA_cumsum_ptrs, mask=offs_k < K_MAX - k, other=0.0).to(tl.float32)
+         cb *= tl.exp(dA_cs_k[None, :] - dA_cs_m[:, None])
+         # If we don't have the (k + offs_k[None, :] < K_MAX) mask, for indices outside this range,
+@@ -193,22 +340,39 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
+     dt_ptrs = dt_ptr + offs_m * stride_dt_csize
+     dt_m = tl.load(dt_ptrs, mask=offs_m < chunk_size_limit, other=0.0).to(tl.float32)
+     dx = acc * dt_m[:, None]
+-    dx_ptr += pid_b * stride_dx_batch + pid_c * chunk_size * stride_dx_seqlen + pid_h * stride_dx_head
++    dx_ptr += (
++        pid_b * stride_dx_batch + pid_c * chunk_size * stride_dx_seqlen + pid_h * stride_dx_head
++    )
+     dx_ptrs = dx_ptr + (offs_m[:, None] * stride_dx_seqlen + offs_n[None, :] * stride_dx_hdim)
+     if HAS_D:
+-        dout_res_ptrs = dout_ptr + (offs_m[:, None] * stride_dout_seqlen + offs_n[None, :] * stride_dout_hdim)
+-        dout_res = tl.load(dout_res_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim), other=0.0).to(tl.float32)
++        dout_res_ptrs = dout_ptr + (
++            offs_m[:, None] * stride_dout_seqlen + offs_n[None, :] * stride_dout_hdim
++        )
++        dout_res = tl.load(
++            dout_res_ptrs,
++            mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim),
++            other=0.0,
++        ).to(tl.float32)
+         if D_HAS_HDIM:
+-            D = tl.load(D_ptr + pid_h * stride_D_head + offs_n, mask=offs_n < hdim, other=0.0).to(tl.float32)
++            D = tl.load(D_ptr + pid_h * stride_D_head + offs_n, mask=offs_n < hdim, other=0.0).to(
++                tl.float32
++            )
+         else:
+             D = tl.load(D_ptr + pid_h * stride_D_head).to(tl.float32)
+         dx += dout_res * D
+     tl.store(dx_ptrs, dx, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim))
+ 
+     x_ptrs = x_ptr + (offs_m[:, None] * stride_x_seqlen + offs_n[None, :] * stride_x_hdim)
+-    x = tl.load(x_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim), other=0.0).to(tl.float32)
++    x = tl.load(
++        x_ptrs, mask=(offs_m[:, None] < chunk_size_limit) & (offs_n[None, :] < hdim), other=0.0
++    ).to(tl.float32)
+     if HAS_D:
+-        dD_ptr += pid_b * stride_dD_batch + pid_c * stride_dD_chunk + pid_h * stride_dD_head + pid_m * stride_dD_csize
++        dD_ptr += (
++            pid_b * stride_dD_batch
++            + pid_c * stride_dD_chunk
++            + pid_h * stride_dD_head
++            + pid_m * stride_dD_csize
++        )
+         if D_HAS_HDIM:
+             dD_ptrs = dD_ptr + offs_n * stride_dD_hdim
+             dD = tl.sum(dout_res * x, axis=0)
+@@ -221,7 +385,9 @@ def _chunk_scan_chunk_state_bwd_dx_kernel(
+     tl.atomic_add(ddt_ptrs, ddt, mask=offs_m < chunk_size)
+ 
+ 
+-def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=None, seq_idx=None, dx=None):
++def _chunk_scan_chunk_state_bwd_dx(
++    x, dt, dA_cumsum, B, CB, dout, dstates, D=None, seq_idx=None, dx=None
++):
+     batch, seqlen, nheads, headdim = x.shape
+     _, _, nchunks, chunk_size = dt.shape
+     _, _, ngroups, dstate = B.shape
+@@ -238,41 +404,102 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
+         assert D.shape == (nheads, headdim) or D.shape == (nheads,)
+         assert D.stride(-1) == 1
+         BLOCK_SIZE_min = 32
+-        dD = torch.empty(triton.cdiv(chunk_size, BLOCK_SIZE_min), batch, nchunks, nheads,
+-                         headdim if D.dim() == 2 else 1, device=D.device, dtype=torch.float32)
++        dD = torch.empty(
++            triton.cdiv(chunk_size, BLOCK_SIZE_min),
++            batch,
++            nchunks,
++            nheads,
++            headdim if D.dim() == 2 else 1,
++            device=D.device,
++            dtype=torch.float32,
++        )
+     else:
+         dD = None
+-    dD_strides = ((dD.stride(0), dD.stride(1), dD.stride(2), dD.stride(3), dD.stride(4))
+-                    if D is not None else (0, 0, 0, 0, 0))
++    dD_strides = (
++        (dD.stride(0), dD.stride(1), dD.stride(2), dD.stride(3), dD.stride(4))
++        if D is not None
++        else (0, 0, 0, 0, 0)
++    )
+     if dx is None:
+         dx = torch.empty_like(x)
+     else:
+         assert dx.shape == x.shape
+     ddt = torch.empty(batch, nheads, nchunks, chunk_size, device=dout.device, dtype=torch.float32)
+-    grid_dx = lambda META: (triton.cdiv(chunk_size, META['BLOCK_SIZE_M']) * triton.cdiv(headdim, META['BLOCK_SIZE_N']),
+-                        batch * nchunks, nheads)
++    grid_dx = lambda META: (
++        triton.cdiv(chunk_size, META["BLOCK_SIZE_M"]) * triton.cdiv(headdim, META["BLOCK_SIZE_N"]),
++        batch * nchunks,
++        nheads,
++    )
+     with torch.cuda.device(x.device.index):
+         _chunk_scan_chunk_state_bwd_dx_kernel[grid_dx](
+-            x, CB, dout, dt, dA_cumsum, seq_idx, D, B, dstates, dx, ddt, dD,
+-            chunk_size, headdim, dstate,
+-            batch, seqlen, nheads // ngroups,
+-            x.stride(0), x.stride(1), x.stride(2), x.stride(3),
+-            CB.stride(0), CB.stride(1), CB.stride(2), CB.stride(-1), CB.stride(-2),
+-            dout.stride(0), dout.stride(1), dout.stride(2), dout.stride(3),
+-            dt.stride(0), dt.stride(2), dt.stride(1), dt.stride(3),
+-            dA_cumsum.stride(0), dA_cumsum.stride(2), dA_cumsum.stride(1), dA_cumsum.stride(3),
++            x,
++            CB,
++            dout,
++            dt,
++            dA_cumsum,
++            seq_idx,
++            D,
++            B,
++            dstates,
++            dx,
++            ddt,
++            dD,
++            chunk_size,
++            headdim,
++            dstate,
++            batch,
++            seqlen,
++            nheads // ngroups,
++            x.stride(0),
++            x.stride(1),
++            x.stride(2),
++            x.stride(3),
++            CB.stride(0),
++            CB.stride(1),
++            CB.stride(2),
++            CB.stride(-1),
++            CB.stride(-2),
++            dout.stride(0),
++            dout.stride(1),
++            dout.stride(2),
++            dout.stride(3),
++            dt.stride(0),
++            dt.stride(2),
++            dt.stride(1),
++            dt.stride(3),
++            dA_cumsum.stride(0),
++            dA_cumsum.stride(2),
++            dA_cumsum.stride(1),
++            dA_cumsum.stride(3),
+             *((seq_idx.stride(0), seq_idx.stride(1)) if seq_idx is not None else (0, 0)),
+             D.stride(0) if D is not None else 0,
+-            B.stride(0), B.stride(1), B.stride(2), B.stride(3),
+-            dstates.stride(0), dstates.stride(1), dstates.stride(2), dstates.stride(3), dstates.stride(4),
+-            dx.stride(0), dx.stride(1), dx.stride(2), dx.stride(3),
+-            ddt.stride(0), ddt.stride(2), ddt.stride(1), ddt.stride(3),
+-            dD_strides[1], dD_strides[2], dD_strides[3], dD_strides[0], dD_strides[4],
++            B.stride(0),
++            B.stride(1),
++            B.stride(2),
++            B.stride(3),
++            dstates.stride(0),
++            dstates.stride(1),
++            dstates.stride(2),
++            dstates.stride(3),
++            dstates.stride(4),
++            dx.stride(0),
++            dx.stride(1),
++            dx.stride(2),
++            dx.stride(3),
++            ddt.stride(0),
++            ddt.stride(2),
++            ddt.stride(1),
++            ddt.stride(3),
++            dD_strides[1],
++            dD_strides[2],
++            dD_strides[3],
++            dD_strides[0],
++            dD_strides[4],
+             D is not None,
+             D.dim() == 2 if D is not None else True,
+             HAS_SEQ_IDX=seq_idx is not None,
+             BLOCK_SIZE_DSTATE=max(triton.next_power_of_2(dstate), 16),
+-            IS_TRITON_22=TRITON_22
++            IS_TRITON_22=TRITON_22,
+         )
+     if D is not None:
+         BLOCK_SIZE_actual = _chunk_scan_chunk_state_bwd_dx_kernel.best_config.kwargs["BLOCK_SIZE_M"]
+@@ -365,7 +592,7 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
+ #     states, final_states = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
+ #                                                 initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
+ #                                                 seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype)
+-    
++
+ #     states, final_states = [rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]]
+ #     #print("=== _mamba_chunk_scan_combined_fwd :: INTERMEDIATES/OUTPUT ===")
+ #     #_tensor_mem_report("states_after_passing", states)
+@@ -387,14 +614,61 @@ def _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=Non
+ #         varlen_states = chunk_state_varlen(B.squeeze(0), x.squeeze(0), dt.squeeze(0), dA_cumsum.squeeze(0),
+ #                                            cu_seqlens, states.squeeze(0))
+ #         return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
++_ROTATION_U = None  # Set by _inject_calib_rotation() for calibration
++_ROTATION_R = None
++_DQK_B = None  # ours: diagonal key scaling (G,N) multipliers for B (D⁻¹) and C (D), set per layer during calibration
++_DQK_C = None
++
++
+ def _mamba_chunk_scan_combined_fwd(
+-    x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None,
+-    initial_states=None, seq_idx=None, cu_seqlens=None,
+-    dt_softplus=False, dt_limit=(0.0, float("inf"),),collect_obs=None
++    x,
++    dt,
++    A,
++    B,
++    C,
++    chunk_size,
++    D=None,
++    z=None,
++    dt_bias=None,
++    initial_states=None,
++    seq_idx=None,
++    cu_seqlens=None,
++    dt_softplus=False,
++    dt_limit=(
++        0.0,
++        float("inf"),
++    ),
++    collect_obs=None,
+ ):
+     batch, seqlen, nheads, headdim = x.shape
+     _, _, ngroups, dstate = B.shape
+ 
++    # ours: diagonal key scaling C·D, B·D⁻¹ (exact), applied before the rotation like the runtime kernel
++    if _DQK_B is not None:
++        B = B * _DQK_B.to(B.device, B.dtype)
++        C = C * _DQK_C.to(C.device, C.dtype)
++    # Apply Hadamard rotations before processing (set during calibration).
++    # Supports 2D (shared across heads/groups) or 3D (per-head / per-group) tensors.
++    # Convention: _ROTATION_U / _ROTATION_R store the *un-rot* matrix Rᵀ; the
++    # forward rotation is its transpose, which is computed inline.
++    if _ROTATION_U is not None:
++        U = _ROTATION_U.to(x.device, x.dtype)
++        if U.dim() == 3:
++            # Per-head: x[b,t,h,p] @ R_h where R_h = U_h.T → einsum on (q, p) reversal
++            x = torch.einsum("bthp,hqp->bthq", x, U)
++        else:
++            x = x @ U.T
++    if _ROTATION_R is not None:
++        R = _ROTATION_R.to(B.device, B.dtype)
++        if R.dim() == 3:
++            # Per-group: B[b,t,g,n] @ R_g.T = forward rotation per group
++            B = torch.einsum("btgn,gmn->btgm", B, R)
++            C = torch.einsum("btgn,gmn->btgm", C, R)
++        else:
++            RT = R.T
++            B = B @ RT
++            C = C @ RT
++
+     assert nheads % ngroups == 0
+     assert B.shape == (batch, seqlen, ngroups, dstate)
+     assert x.shape == (batch, seqlen, nheads, headdim)
+@@ -425,72 +699,79 @@ def _mamba_chunk_scan_combined_fwd(
+     from contextlib import contextmanager
+ 
+     def _fmt_bytes(x: int) -> str:
+-            return f"{x/1024/1024:.1f}MB"
++        return f"{x / 1024 / 1024:.1f}MB"
+ 
+     @contextmanager
+-    def _time_block(label: str, device=None, sync: bool=True, mem: bool=True, reset_peak: bool=False):
+-            """
+-            - 시간 측정: CUDA면 cudaEvent, 아니면 perf_counter
+-            - 메모리 측정(mem=True):
+-                * 시작/끝 alloc/reserved
+-                * 블록 내 peak alloc/reserved (reset_peak=True면 블록 시작 전에 피크 리셋)
+-            """
+-            use_cuda = (device is not None) and torch.cuda.is_available()
+-
+-            # ---- pre: time + mem ----
++    def _time_block(
++        label: str, device=None, sync: bool = True, mem: bool = True, reset_peak: bool = False
++    ):
++        """- 시간 측정: CUDA면 cudaEvent, 아니면 perf_counter
++        - 메모리 측정(mem=True):
++            * 시작/끝 alloc/reserved
++            * 블록 내 peak alloc/reserved (reset_peak=True면 블록 시작 전에 피크 리셋)
++        """
++        use_cuda = (device is not None) and torch.cuda.is_available()
++
++        # ---- pre: time + mem ----
++        if use_cuda:
++            if sync:
++                torch.cuda.synchronize(device)
++            start_ev = torch.cuda.Event(enable_timing=True)
++            end_ev = torch.cuda.Event(enable_timing=True)
++            start_ev.record()
++
++            if mem:
++                if reset_peak:
++                    torch.cuda.reset_peak_memory_stats(device)
++                alloc0 = torch.cuda.memory_allocated(device)
++                reserv0 = torch.cuda.memory_reserved(device)
++        else:
++            t0 = time.perf_counter()
++
++        try:
++            yield
++        finally:
++            # ---- post: time + mem ----
+             if use_cuda:
+-                if sync: torch.cuda.synchronize(device)
+-                start_ev = torch.cuda.Event(enable_timing=True); end_ev = torch.cuda.Event(enable_timing=True)
+-                start_ev.record()
++                end_ev.record()
++                if sync:
++                    torch.cuda.synchronize(device)
++                ms = start_ev.elapsed_time(end_ev)
+ 
+                 if mem:
+-                    if reset_peak:
+-                        torch.cuda.reset_peak_memory_stats(device)
+-                    alloc0   = torch.cuda.memory_allocated(device)
+-                    reserv0  = torch.cuda.memory_reserved(device)
+-            else:
+-                t0 = time.perf_counter()
+-
+-            try:
+-                yield
+-            finally:
+-                # ---- post: time + mem ----
+-                if use_cuda:
+-                    end_ev.record()
+-                    if sync: torch.cuda.synchronize(device)
+-                    ms = start_ev.elapsed_time(end_ev)
+-
+-                    if mem:
+-                        alloc1   = torch.cuda.memory_allocated(device)
+-                        reserv1  = torch.cuda.memory_reserved(device)
+-                        peak_alloc  = torch.cuda.max_memory_allocated(device)
+-                        peak_reserv = torch.cuda.max_memory_reserved(device)
+-
+-                        print(
+-                            f"[TIME] {label:<24} {ms:.3f} ms\n"
+-                            f"[MEM ] {label:<24} "
+-                            f"alloc {_fmt_bytes(alloc0)} → {_fmt_bytes(alloc1)} (Δ {_fmt_bytes(alloc1-alloc0)}) | "
+-                            f"reserved {_fmt_bytes(reserv0)} → {_fmt_bytes(reserv1)} (Δ {_fmt_bytes(reserv1-reserv0)}) | "
+-                            f"peak alloc {_fmt_bytes(peak_alloc)}, peak reserved {_fmt_bytes(peak_reserv)}"
+-                        )
+-                    else:
+-                        print(f"[TIME] {label:<24} {ms:.3f} ms")
++                    alloc1 = torch.cuda.memory_allocated(device)
++                    reserv1 = torch.cuda.memory_reserved(device)
++                    peak_alloc = torch.cuda.max_memory_allocated(device)
++                    peak_reserv = torch.cuda.max_memory_reserved(device)
++
++                    print(
++                        f"[TIME] {label:<24} {ms:.3f} ms\n"
++                        f"[MEM ] {label:<24} "
++                        f"alloc {_fmt_bytes(alloc0)} → {_fmt_bytes(alloc1)} (Δ {_fmt_bytes(alloc1 - alloc0)}) | "
++                        f"reserved {_fmt_bytes(reserv0)} → {_fmt_bytes(reserv1)} (Δ {_fmt_bytes(reserv1 - reserv0)}) | "
++                        f"peak alloc {_fmt_bytes(peak_alloc)}, peak reserved {_fmt_bytes(peak_reserv)}"
++                    )
+                 else:
+-                    t1 = time.perf_counter()
+-                    print(f"[TIME] {label:<24} {(t1 - t0)*1000:.3f} ms")
+-                    # CPU 메모리도 보고 싶으면 psutil 사용 (옵션)
+-                    # try:
+-                    #     import psutil, os
+-                    #     rss = psutil.Process(os.getpid()).memory_info().rss
+-                    #     print(f"[MEM ] {label:<24} RSS {_fmt_bytes(rss)}")
+-                    # except Exception:
+-                    #     pass
++                    print(f"[TIME] {label:<24} {ms:.3f} ms")
++            else:
++                t1 = time.perf_counter()
++                print(f"[TIME] {label:<24} {(t1 - t0) * 1000:.3f} ms")
++                # CPU 메모리도 보고 싶으면 psutil 사용 (옵션)
++                # try:
++                #     import psutil, os
++                #     rss = psutil.Process(os.getpid()).memory_info().rss
++                #     print(f"[MEM ] {label:<24} RSS {_fmt_bytes(rss)}")
++                # except Exception:
++                #     pass
++
+     dev = x.device if x.is_cuda else None
+     dA_cumsum, dt = _chunk_cumsum_fwd(
+-                dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit
+-            )
++        dt, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit
++    )
+ 
+-    states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True,collect_obs=collect_obs)
++    states = _chunk_state_fwd(
++        B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True, collect_obs=collect_obs
++    )
+     if collect_obs is not None:
+         amax_state = states.abs().amax(dim=(0, -1, 1))  # (H,P)
+         if (obs := collect_obs.get("state_cali", None)) is not None:
+@@ -498,37 +779,74 @@ def _mamba_chunk_scan_combined_fwd(
+             obs.update_amax(amax_state)
+ 
+     states, final_states = _state_passing_fwd(
+-                rearrange(states, "... p n -> ... (p n)"),
+-                dA_cumsum[:, :, :, -1],
+-                initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
+-                seq_idx=seq_idx, chunk_size=chunk_size, out_dtype=C.dtype,
+-            )
++        rearrange(states, "... p n -> ... (p n)"),
++        dA_cumsum[:, :, :, -1],
++        initial_states=rearrange(initial_states, "... p n -> ... (p n)")
++        if initial_states is not None
++        else None,
++        seq_idx=seq_idx,
++        chunk_size=chunk_size,
++        out_dtype=C.dtype,
++    )
+     states, final_states = [
+-                rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]
+-            ]
++        rearrange(t, "... (p n) -> ... p n", n=dstate) for t in [states, final_states]
++    ]
+ 
+     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+ 
+-    out, out_x = _chunk_scan_fwd(CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx,collect_obs=collect_obs)
+-
+-
++    out, out_x = _chunk_scan_fwd(
++        CB, x, dt, dA_cumsum, C, states, D=D, z=z, seq_idx=seq_idx, collect_obs=collect_obs
++    )
+ 
++    # Un-rotate output (U rotation is NOT output-invariant).
++    if _ROTATION_U is not None:
++        U = _ROTATION_U.to(out.device, out.dtype)
++        if U.dim() == 3:
++            out = torch.einsum("bthp,hpq->bthq", out, U)
++        else:
++            out = out @ U
+ 
+     if cu_seqlens is None:
+         return out, out_x, dt, dA_cumsum, states, final_states
+     else:
+-        assert batch == 1, "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
++        assert batch == 1, (
++            "passing cu_seqlens to get the varlen states is only supported if batch dimension is 1"
++        )
+         varlen_states = chunk_state_varlen(
+-            B.squeeze(0), x.squeeze(0), dt.squeeze(0), dA_cumsum.squeeze(0),
+-            cu_seqlens, states.squeeze(0)
++            B.squeeze(0),
++            x.squeeze(0),
++            dt.squeeze(0),
++            dA_cumsum.squeeze(0),
++            cu_seqlens,
++            states.squeeze(0),
+         )
+         return out, out_x, dt, dA_cumsum, states, final_states, varlen_states
+ 
+ 
+-def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None, z=None,
+-                                   dt_bias=None, initial_states=None, dfinal_states=None, seq_idx=None, dt_softplus=False,
+-                                   dt_limit=(0.0, float("inf")),
+-                                   dx=None, ddt=None, dB=None, dC=None, dz=None, recompute_output=False):
++def _mamba_chunk_scan_combined_bwd(
++    dout,
++    x,
++    dt,
++    A,
++    B,
++    C,
++    out,
++    chunk_size,
++    D=None,
++    z=None,
++    dt_bias=None,
++    initial_states=None,
++    dfinal_states=None,
++    seq_idx=None,
++    dt_softplus=False,
++    dt_limit=(0.0, float("inf")),
++    dx=None,
++    ddt=None,
++    dB=None,
++    dC=None,
++    dz=None,
++    recompute_output=False,
++):
+     if dout.stride(-1) != 1:
+         dout = dout.contiguous()
+     batch, seqlen, nheads, headdim = x.shape
+@@ -568,16 +886,33 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
+     # TD: For some reason Triton (2.1.0 and 2.2.0) errors with
+     # "[CUDA]: invalid device context" (e.g. during varlne test), and cloning makes it work. Idk why.
+     dt_in = dt.clone()
+-    dA_cumsum, dt = _chunk_cumsum_fwd(dt_in, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus,
+-                                      dt_limit=dt_limit)
++    dA_cumsum, dt = _chunk_cumsum_fwd(
++        dt_in, A, chunk_size, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit
++    )
+     CB = _bmm_chunk_fwd(C, B, chunk_size, seq_idx=seq_idx, output_dtype=torch.float32)
+     states = _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=seq_idx, states_in_fp32=True)
+-    states, _ = _state_passing_fwd(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1],
+-                                   initial_states=rearrange(initial_states, "... p n -> ... (p n)") if initial_states is not None else None,
+-                                   seq_idx=seq_idx, chunk_size=chunk_size)
++    states, _ = _state_passing_fwd(
++        rearrange(states, "... p n -> ... (p n)"),
++        dA_cumsum[:, :, :, -1],
++        initial_states=rearrange(initial_states, "... p n -> ... (p n)")
++        if initial_states is not None
++        else None,
++        seq_idx=seq_idx,
++        chunk_size=chunk_size,
++    )
+     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
+     if z is not None:
+-        dz, dout, dD, *rest = _chunk_scan_bwd_dz(x, z, out, dout, chunk_size=chunk_size, has_ddAcs=False, D=D, dz=dz, recompute_output=recompute_output)
++        dz, dout, dD, *rest = _chunk_scan_bwd_dz(
++            x,
++            z,
++            out,
++            dout,
++            chunk_size=chunk_size,
++            has_ddAcs=False,
++            D=D,
++            dz=dz,
++            recompute_output=recompute_output,
++        )
+         outz = rest[0] if recompute_output else out
+     else:
+         dz = None
+@@ -591,7 +926,9 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
+         rearrange(states, "... p n -> ... (p n)"),
+         dA_cumsum[:, :, :, -1],
+         rearrange(dstates, "... p n -> ... (p n)"),
+-        dfinal_states=rearrange(dfinal_states, "... p n -> ... (p n)") if dfinal_states is not None else None,
++        dfinal_states=rearrange(dfinal_states, "... p n -> ... (p n)")
++        if dfinal_states is not None
++        else None,
+         seq_idx=seq_idx,
+         has_initial_states=initial_states is not None,
+         dstates_dtype=x.dtype,
+@@ -604,12 +941,22 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
+     # The final states is not stored.
+     states = rearrange(states, "... (p n) -> ... p n", n=dstate)
+     dstates = rearrange(dstates, "... (p n) -> ... p n", n=dstate)
+-    dinitial_states = rearrange(dinitial_states, "... (p n) -> ... p n", n=dstate) if dinitial_states is not None else None
+-    dx, ddt, dD_from_x = _chunk_scan_chunk_state_bwd_dx(x, dt, dA_cumsum, B, CB, dout, dstates, D=D, seq_idx=seq_idx, dx=dx)
++    dinitial_states = (
++        rearrange(dinitial_states, "... (p n) -> ... p n", n=dstate)
++        if dinitial_states is not None
++        else None
++    )
++    dx, ddt, dD_from_x = _chunk_scan_chunk_state_bwd_dx(
++        x, dt, dA_cumsum, B, CB, dout, dstates, D=D, seq_idx=seq_idx, dx=dx
++    )
+     # dB = _chunk_state_bwd_db(x, dt, dA_cumsum, dstates, seq_idx=seq_idx, ngroups=ngroups)
+-    dB, ddA_next = _chunk_state_bwd_db(x, dt, dA_cumsum, dstates, seq_idx=seq_idx, B=B, ngroups=ngroups)
++    dB, ddA_next = _chunk_state_bwd_db(
++        x, dt, dA_cumsum, dstates, seq_idx=seq_idx, B=B, ngroups=ngroups
++    )
+     # dC = _chunk_scan_bwd_dC(states[:, :-1].to(x.dtype), dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups)
+-    dC, ddA_cumsum_prev = _chunk_scan_bwd_dC(states.to(x.dtype), dA_cumsum, dout, seq_idx=seq_idx, C=C, ngroups=ngroups)
++    dC, ddA_cumsum_prev = _chunk_scan_bwd_dC(
++        states.to(x.dtype), dA_cumsum, dout, seq_idx=seq_idx, C=C, ngroups=ngroups
++    )
+     # Computing ddA with the dcb kernel is much slower, so we're not using it for now
+     dCB = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=seq_idx, ngroups=ngroups)
+     # dCB, ddA_tmp = _chunk_scan_bwd_dcb(x, dt, dA_cumsum, dout, seq_idx=seq_idx, CB=CB, ngroups=ngroups)
+@@ -635,7 +982,16 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
+     ddA = _chunk_scan_bwd_ddAcs_stable(x, dt, dA_cumsum, dout, CB)
+     ddA += ddA_next + ddA_prev
+ 
+-    ddt_given, dA, ddt_bias = _chunk_cumsum_bwd(ddA, ddt, dt_in, A, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit, ddt=ddt_given)
++    ddt_given, dA, ddt_bias = _chunk_cumsum_bwd(
++        ddA,
++        ddt,
++        dt_in,
++        A,
++        dt_bias=dt_bias,
++        dt_softplus=dt_softplus,
++        dt_limit=dt_limit,
++        ddt=ddt_given,
++    )
+ 
+     # These 2 lines are just to test ddt and dA being computed by old code
+     # _, dA = selective_scan_bwd(dout, x, dt, A, B, C, D=D.float(), z=z)
+@@ -646,8 +1002,7 @@ def _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, chunk_size, D=None
+ 
+ 
+ def selective_scan_bwd(dout, x, dt, A, B, C, D=None, z=None):
+-    """
+-    Argument:
++    """Argument:
+         dout: (batch, seqlen, nheads, headdim)
+         x: (batch, seqlen, nheads, headdim)
+         dt: (batch, nheads, nchunks, chunk_size) or (batch, nheads, headdim, nchunks, chunk_size)
+@@ -656,6 +1011,7 @@ def selective_scan_bwd(dout, x, dt, A, B, C, D=None, z=None):
+         C: (batch, seqlen, ngroups, dstate)
+         D: (nheads, headdim) or (nheads,)
+         z: (batch, seqlen, nheads, headdim)
++
+     Return:
+         out: (batch, seqlen, nheads, headdim)
+     """
+@@ -711,8 +1067,20 @@ def selective_scan_bwd(dout, x, dt, A, B, C, D=None, z=None):
+     # backward of selective_scan with the backward of chunk).
+     # Here we just pass in None and dz will be allocated in the C++ code.
+     _, ddt, dA, *rest = selective_scan.bwd(
+-        x, dt.to(dtype=x.dtype), A, B, C, D, z, None, dout, intermediate, out, None, False,
+-        False  # option to recompute out_z, not used here
++        x,
++        dt.to(dtype=x.dtype),
++        A,
++        B,
++        C,
++        D,
++        z,
++        None,
++        dout,
++        intermediate,
++        out,
++        None,
++        False,
++        False,  # option to recompute out_z, not used here
+     )
+     ddt = rearrange(ddt, "b (h p) (c l) -> b h p c l", p=headdim, l=chunk_size)
+     if squeeze_dt:
+@@ -722,13 +1090,13 @@ def selective_scan_bwd(dout, x, dt, A, B, C, D=None, z=None):
+     return ddt, dA
+ 
+ 
+-
+ def _fmt_bytes(n):
+-    for unit in ["B","KB","MB","GB","TB"]:
++    for unit in ["B", "KB", "MB", "GB", "TB"]:
+         if n < 1024 or unit == "TB":
+             return f"{n:.2f} {unit}"
+         n /= 1024
+ 
++
+ def _tensor_mem_report(name, t):
+     if t is None:
+         print(f"{name}: None")
+@@ -750,22 +1118,73 @@ def _tensor_mem_report(name, t):
+         f"tensor_bytes={_fmt_bytes(nbytes)} | storage_bytes={_fmt_bytes(storage_nbytes)}"
+     )
+ 
+-class MambaChunkScanCombinedFn(torch.autograd.Function):
+ 
++class MambaChunkScanCombinedFn(torch.autograd.Function):
+     @staticmethod
+-    def forward(ctx, x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False, return_varlen_states=False,collect_obs=None):
++    def forward(
++        ctx,
++        x,
++        dt,
++        A,
++        B,
++        C,
++        chunk_size,
++        D=None,
++        z=None,
++        dt_bias=None,
++        initial_states=None,
++        seq_idx=None,
++        cu_seqlens=None,
++        dt_softplus=False,
++        dt_limit=(0.0, float("inf")),
++        return_final_states=False,
++        return_varlen_states=False,
++        collect_obs=None,
++    ):
+         # #############################################################################debuggin###########################################################
+         ################################################################################################################################################
+         ctx.dt_dtype = dt.dtype
+         if not return_varlen_states:
+             cu_seqlens = None
+         else:
+-            assert cu_seqlens is not None, "cu_seqlens must be provided if return_varlen_states is True"
++            assert cu_seqlens is not None, (
++                "cu_seqlens must be provided if return_varlen_states is True"
++            )
+         if x.is_cuda:
+-            start = torch.cuda.Event(enable_timing=True); end = torch.cuda.Event(enable_timing=True)
++            start = torch.cuda.Event(enable_timing=True)
++            end = torch.cuda.Event(enable_timing=True)
+             start.record()
+-        out, out_x, dt_out, dA_cumsum, states, final_states, *rest = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, cu_seqlens=cu_seqlens, dt_softplus=dt_softplus, dt_limit=dt_limit,collect_obs=collect_obs,)
+-        ctx.save_for_backward(out if z is None else out_x, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx)
++        out, out_x, dt_out, dA_cumsum, states, final_states, *rest = _mamba_chunk_scan_combined_fwd(
++            x,
++            dt,
++            A,
++            B,
++            C,
++            chunk_size,
++            D=D,
++            z=z,
++            dt_bias=dt_bias,
++            initial_states=initial_states,
++            seq_idx=seq_idx,
++            cu_seqlens=cu_seqlens,
++            dt_softplus=dt_softplus,
++            dt_limit=dt_limit,
++            collect_obs=collect_obs,
++        )
++        ctx.save_for_backward(
++            out if z is None else out_x,
++            x,
++            dt,
++            dA_cumsum,
++            A,
++            B,
++            C,
++            D,
++            z,
++            dt_bias,
++            initial_states,
++            seq_idx,
++        )
+         ctx.dt_softplus = dt_softplus
+         ctx.chunk_size = chunk_size
+         ctx.dt_limit = dt_limit
+@@ -775,19 +1194,75 @@ class MambaChunkScanCombinedFn(torch.autograd.Function):
+             return out if not return_final_states else (out, final_states)
+         else:
+             varlen_states = rest[0]
+-            return (out, varlen_states) if not return_final_states else (out, final_states, varlen_states)
++            return (
++                (out, varlen_states)
++                if not return_final_states
++                else (out, final_states, varlen_states)
++            )
++
+     @staticmethod
+     def backward(ctx, dout, *args):
+         out, x, dt, dA_cumsum, A, B, C, D, z, dt_bias, initial_states, seq_idx = ctx.saved_tensors
+         assert not ctx.return_varlen_states, "return_varlen_states is not supported in backward"
+         dfinal_states = args[0] if ctx.return_final_states else None
+-        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=ctx.dt_softplus, dt_limit=ctx.dt_limit)
+-        return dx, ddt, dA, dB, dC, None, dD, dz, ddt_bias, dinitial_states, None, None, None, None, None, None
++        dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(
++            dout,
++            x,
++            dt,
++            A,
++            B,
++            C,
++            out,
++            ctx.chunk_size,
++            D=D,
++            z=z,
++            dt_bias=dt_bias,
++            initial_states=initial_states,
++            dfinal_states=dfinal_states,
++            seq_idx=seq_idx,
++            dt_softplus=ctx.dt_softplus,
++            dt_limit=ctx.dt_limit,
++        )
++        return (
++            dx,
++            ddt,
++            dA,
++            dB,
++            dC,
++            None,
++            dD,
++            dz,
++            ddt_bias,
++            dinitial_states,
++            None,
++            None,
++            None,
++            None,
++            None,
++            None,
++        )
+ 
+ 
+-def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, initial_states=None, seq_idx=None, cu_seqlens=None, dt_softplus=False, dt_limit=(0.0, float("inf")), return_final_states=False, return_varlen_states=False,collect_obs=None):
+-    """
+-    Argument:
++def mamba_chunk_scan_combined(
++    x,
++    dt,
++    A,
++    B,
++    C,
++    chunk_size,
++    D=None,
++    z=None,
++    dt_bias=None,
++    initial_states=None,
++    seq_idx=None,
++    cu_seqlens=None,
++    dt_softplus=False,
++    dt_limit=(0.0, float("inf")),
++    return_final_states=False,
++    return_varlen_states=False,
++    collect_obs=None,
++):
++    """Argument:
+         x: (batch, seqlen, nheads, headdim)
+         dt: (batch, seqlen, nheads)
+         A: (nheads)
+@@ -804,12 +1279,29 @@ def mamba_chunk_scan_combined(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bia
+     Return:
+         out: (batch, seqlen, nheads, headdim)
+     """
+-    return MambaChunkScanCombinedFn.apply(x, dt, A, B, C, chunk_size, D, z, dt_bias, initial_states, seq_idx, cu_seqlens, dt_softplus, dt_limit, return_final_states, return_varlen_states,collect_obs)
++    return MambaChunkScanCombinedFn.apply(
++        x,
++        dt,
++        A,
++        B,
++        C,
++        chunk_size,
++        D,
++        z,
++        dt_bias,
++        initial_states,
++        seq_idx,
++        cu_seqlens,
++        dt_softplus,
++        dt_limit,
++        return_final_states,
++        return_varlen_states,
++        collect_obs,
++    )
+ 
+ 
+ def mamba_chunk_scan(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, dt_softplus=False):
+-    """
+-    Argument:
++    """Argument:
+         x: (batch, seqlen, nheads, headdim)
+         dt: (batch, seqlen, nheads)
+         A: (nheads)
+@@ -818,6 +1310,7 @@ def mamba_chunk_scan(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, d
+         D: (nheads, headdim) or (nheads,)
+         z: (batch, seqlen, nheads, headdim)
+         dt_bias: (nheads,)
++
+     Return:
+         out: (batch, seqlen, nheads, headdim)
+     """
+@@ -837,16 +1330,20 @@ def mamba_chunk_scan(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, d
+     # 1. Compute the state for each chunk
+     states = chunk_state(B, x, dt, dA_cumsum, states_in_fp32=True)
+     # 2. Pass the state to all the chunks by weighted cumsum.
+-    states = rearrange(state_passing(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1])[0],
+-                       "... (p n) -> ... p n", n=dstate)
++    states = rearrange(
++        state_passing(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1])[0],
++        "... (p n) -> ... p n",
++        n=dstate,
++    )
+     # 3. Compute the output for each chunk
+     out = chunk_scan(B, C, x, dt, dA_cumsum, states, D=D, z=z)
+     return out
+ 
+ 
+-def ssd_chunk_scan_combined_ref(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, dt_softplus=False):
+-    """
+-    Argument:
++def ssd_chunk_scan_combined_ref(
++    x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, dt_softplus=False
++):
++    """Argument:
+         x: (batch, seqlen, nheads, headdim)
+         dt: (batch, seqlen, nheads)
+         A: (nheads)
+@@ -855,6 +1352,7 @@ def ssd_chunk_scan_combined_ref(x, dt, A, B, C, chunk_size, D=None, z=None, dt_b
+         D: (nheads, headdim) or (nheads,)
+         z: (batch, seqlen, nheads, headdim)
+         dt_bias: (nheads,)
++
+     Return:
+         out: (batch, seqlen, nheads, headdim)
+     """
+@@ -883,8 +1381,11 @@ def ssd_chunk_scan_combined_ref(x, dt, A, B, C, chunk_size, D=None, z=None, dt_b
+         states = states.to(torch.float32)
+     # 2. Pass the state to all the chunks by weighted cumsum.
+     # state_passing_ref is much less numerically stable
+-    states = rearrange(state_passing_ref(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1])[0],
+-                       "... (p n) -> ... p n", n=dstate)
++    states = rearrange(
++        state_passing_ref(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1])[0],
++        "... (p n) -> ... p n",
++        n=dstate,
++    )
+     states = states.to(states_dtype)
+     # 3. Compute the output for each chunk
+     out = chunk_scan_ref(B, C, x, dt, dA_cumsum, states, D=D, z=z)
+@@ -894,9 +1395,10 @@ def ssd_chunk_scan_combined_ref(x, dt, A, B, C, chunk_size, D=None, z=None, dt_b
+     return out
+ 
+ 
+-def my_ssd_chunk_scan_combined_ref(x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, dt_softplus=False, indices=None):
+-    """
+-    Argument:
++def my_ssd_chunk_scan_combined_ref(
++    x, dt, A, B, C, chunk_size, D=None, z=None, dt_bias=None, dt_softplus=False, indices=None
++):
++    """Argument:
+         x: (batch, seqlen, nheads, headdim)
+         dt: (batch, seqlen, nheads)
+         A: (nheads)
+@@ -905,6 +1407,7 @@ def my_ssd_chunk_scan_combined_ref(x, dt, A, B, C, chunk_size, D=None, z=None, d
+         D: (nheads, headdim) or (nheads,)
+         z: (batch, seqlen, nheads, headdim)
+         dt_bias: (nheads,)
++
+     Return:
+         out: (batch, seqlen, nheads, headdim)
+     """
+@@ -933,8 +1436,11 @@ def my_ssd_chunk_scan_combined_ref(x, dt, A, B, C, chunk_size, D=None, z=None, d
+         states = states.to(torch.float32)
+     # 2. Pass the state to all the chunks by weighted cumsum.
+     # state_passing_ref is much less numerically stable
+-    states = rearrange(state_passing_ref(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1])[0],
+-                       "... (p n) -> ... p n", n=dstate)
++    states = rearrange(
++        state_passing_ref(rearrange(states, "... p n -> ... (p n)"), dA_cumsum[:, :, :, -1])[0],
++        "... (p n) -> ... p n",
++        n=dstate,
++    )
+     states = states.to(states_dtype)
+     # 3. Compute the output for each chunk
+     out = my_chunk_scan_ref(B, C, x, dt, dA_cumsum, states, D=D, z=z, indices=indices)
+@@ -944,9 +1450,10 @@ def my_ssd_chunk_scan_combined_ref(x, dt, A, B, C, chunk_size, D=None, z=None, d
+     return out
+ 
+ 
+-def ssd_selective_scan(x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))):
+-    """
+-    Argument:
++def ssd_selective_scan(
++    x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf"))
++):
++    """Argument:
+         x: (batch, seqlen, nheads, headdim)
+         dt: (batch, seqlen, nheads) or (batch, seqlen, nheads, headdim)
+         A: (nheads) or (dim, dstate)
+@@ -955,6 +1462,7 @@ def ssd_selective_scan(x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus
+         D: (nheads, headdim) or (nheads,)
+         z: (batch, seqlen, nheads, headdim)
+         dt_bias: (nheads,) or (nheads, headdim)
++
+     Return:
+         out: (batch, seqlen, nheads, headdim)
+     """
+@@ -991,15 +1499,29 @@ def ssd_selective_scan(x, dt, A, B, C, D=None, z=None, dt_bias=None, dt_softplus
+         dt = dt.clamp(min=dt_limit[0], max=dt_limit[1]).to(x.dtype)
+         dt_bias = None
+         dt_softplus = None
+-    out = selective_scan_fn(x, dt, A, B, C, D=D, z=z, delta_bias=dt_bias, delta_softplus=dt_softplus)
++    out = selective_scan_fn(
++        x, dt, A, B, C, D=D, z=z, delta_bias=dt_bias, delta_softplus=dt_softplus
++    )
+     return rearrange(out, "b (h p) l -> b l h p", p=headdim)
+ 
+ 
+-def mamba_conv1d_scan_ref(xBC, conv1d_weight, conv1d_bias, dt, A, chunk_size, D=None, z=None,
+-                          dt_bias=None, dt_softplus=False, dt_limit=(0.0, float("inf")),
+-                          activation="silu", headdim=None, ngroups=1):
+-    """
+-    Argument:
++def mamba_conv1d_scan_ref(
++    xBC,
++    conv1d_weight,
++    conv1d_bias,
++    dt,
++    A,
++    chunk_size,
++    D=None,
++    z=None,
++    dt_bias=None,
++    dt_softplus=False,
++    dt_limit=(0.0, float("inf")),
++    activation="silu",
++    headdim=None,
++    ngroups=1,
++):
++    """Argument:
+         xBC: (batch, seqlen, dim + 2 * ngroups * dstate) where dim == nheads * headdim
+         conv1d_weight: (dim + 2 * ngroups * dstate, width)
+         conv1d_bias: (dim + 2 * ngroups * dstate,)
+@@ -1024,29 +1546,62 @@ def mamba_conv1d_scan_ref(xBC, conv1d_weight, conv1d_bias, dt, A, chunk_size, D=
+         else:
+             headdim = D.shape[1]
+         dim = nheads * headdim
+-    xBC = rearrange(causal_conv1d_fn(rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias, activation=activation),
+-                    "b d s -> b s d")
++    xBC = rearrange(
++        causal_conv1d_fn(
++            rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias, activation=activation
++        ),
++        "b d s -> b s d",
++    )
+     dstate = (xBC.shape[-1] - dim) // ngroups // 2
+     x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+     x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+     B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
+     C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
+     z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
+-    out = ssd_selective_scan(x, dt.to(x.dtype), A, B, C, D=D.float(), z=z, dt_bias=dt_bias, dt_softplus=dt_softplus, dt_limit=dt_limit)
++    out = ssd_selective_scan(
++        x,
++        dt.to(x.dtype),
++        A,
++        B,
++        C,
++        D=D.float(),
++        z=z,
++        dt_bias=dt_bias,
++        dt_softplus=dt_softplus,
++        dt_limit=dt_limit,
++    )
+     return rearrange(out, "b s h p -> b s (h p)")
+ 
+ 
+ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
+-
+     @staticmethod
+     @custom_fwd
+-    def forward(ctx, zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu",
+-                rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None,
+-                ngroups=1, norm_before_gate=True):
++    def forward(
++        ctx,
++        zxbcdt,
++        conv1d_weight,
++        conv1d_bias,
++        dt_bias,
++        A,
++        D,
++        chunk_size,
++        initial_states=None,
++        seq_idx=None,
++        dt_limit=(0.0, float("inf")),
++        return_final_states=False,
++        activation="silu",
++        rmsnorm_weight=None,
++        rmsnorm_eps=1e-6,
++        outproj_weight=None,
++        outproj_bias=None,
++        headdim=None,
++        ngroups=1,
++        norm_before_gate=True,
++    ):
+         assert activation in [None, "silu", "swish"]
+         if D.dim() == 1:
+             assert headdim is not None
+-            nheads, = D.shape
++            (nheads,) = D.shape
+         else:
+             nheads, headdim = D.shape
+         batch, seqlen, _ = zxbcdt.shape
+@@ -1055,15 +1610,28 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
+         dstate = (conv1d_weight.shape[0] - dim) // ngroups // 2
+         d_nonssm = (zxbcdt.shape[-1] - 2 * dim - 2 * ngroups * dstate - nheads) // 2
+         assert d_nonssm >= 0
+-        assert zxbcdt.shape == (batch, seqlen, 2 * d_nonssm + 2 * dim + 2 * ngroups * dstate + nheads)
++        assert zxbcdt.shape == (
++            batch,
++            seqlen,
++            2 * d_nonssm + 2 * dim + 2 * ngroups * dstate + nheads,
++        )
+         assert dt_bias.shape == (nheads,)
+         assert A.shape == (nheads,)
+-        zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1)
++        zx0, z, xBC, dt = torch.split(
++            zxbcdt, [2 * d_nonssm, dim, dim + ngroups * dstate * 2, nheads], dim=-1
++        )
+         seq_idx = seq_idx.contiguous() if seq_idx is not None else None
+         xBC_conv = rearrange(
+-            causal_conv1d_cuda.causal_conv1d_fwd(rearrange(xBC, "b s d -> b d s"),
+-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, activation in ["silu", "swish"]),
+-            "b d s -> b s d"
++            causal_conv1d_cuda.causal_conv1d_fwd(
++                rearrange(xBC, "b s d -> b d s"),
++                conv1d_weight,
++                conv1d_bias,
++                seq_idx,
++                None,
++                None,
++                activation in ["silu", "swish"],
++            ),
++            "b d s -> b s d",
+         )
+         x, B, C = torch.split(xBC_conv, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+@@ -1071,13 +1639,41 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
+         C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
+         z = rearrange(z, "b l (h p) -> b l h p", h=nheads) if z is not None else None
+         if rmsnorm_weight is None:
+-            out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit)
++            out, out_x, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(
++                x,
++                dt,
++                A,
++                B,
++                C,
++                chunk_size=chunk_size,
++                D=D,
++                z=z,
++                dt_bias=dt_bias,
++                initial_states=initial_states,
++                seq_idx=seq_idx,
++                dt_softplus=True,
++                dt_limit=dt_limit,
++            )
+             out = rearrange(out, "b s h p -> b s (h p)")
+             rstd = None
+             if d_nonssm > 0:
+                 out = torch.cat([_swiglu_fwd(zx0), out], dim=-1)
+         else:
+-            out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(x, dt, A, B, C, chunk_size=chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=dt_limit)
++            out_x, _, dt_out, dA_cumsum, states, final_states = _mamba_chunk_scan_combined_fwd(
++                x,
++                dt,
++                A,
++                B,
++                C,
++                chunk_size=chunk_size,
++                D=D,
++                z=None,
++                dt_bias=dt_bias,
++                initial_states=initial_states,
++                seq_idx=seq_idx,
++                dt_softplus=True,
++                dt_limit=dt_limit,
++            )
+             # reshape input data into 2D tensor
+             x_rms = rearrange(out_x, "b s h p -> (b s) (h p)")
+             z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+@@ -1085,12 +1681,22 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
+             if d_nonssm == 0:
+                 out = None
+             else:
+-                out01 = torch.empty((batch, seqlen, d_nonssm + dim), dtype=x_rms.dtype, device=x_rms.device)
++                out01 = torch.empty(
++                    (batch, seqlen, d_nonssm + dim), dtype=x_rms.dtype, device=x_rms.device
++                )
+                 out = rearrange(out01[..., d_nonssm:], "b s d -> (b s) d")
+                 _swiglu_fwd(zx0, out=out01[..., :d_nonssm])
+-            out, _, rstd = _layer_norm_fwd(x_rms, rmsnorm_weight, None, rmsnorm_eps, z_rms, out=out,
+-                                           group_size=dim // ngroups,
+-                                           norm_before_gate=norm_before_gate, is_rms_norm=True)
++            out, _, rstd = _layer_norm_fwd(
++                x_rms,
++                rmsnorm_weight,
++                None,
++                rmsnorm_eps,
++                z_rms,
++                out=out,
++                group_size=dim // ngroups,
++                norm_before_gate=norm_before_gate,
++                is_rms_norm=True,
++            )
+             if d_nonssm == 0:
+                 out = rearrange(out, "(b s) d -> b s d", b=batch)
+             else:
+@@ -1104,8 +1710,21 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
+             out = F.linear(out, outproj_weight, outproj_bias)
+         else:
+             assert outproj_bias is None
+-        ctx.save_for_backward(zxbcdt, conv1d_weight, conv1d_bias,
+-                              out_x, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias)
++        ctx.save_for_backward(
++            zxbcdt,
++            conv1d_weight,
++            conv1d_bias,
++            out_x,
++            A,
++            D,
++            dt_bias,
++            initial_states,
++            seq_idx,
++            rmsnorm_weight,
++            rstd,
++            outproj_weight,
++            outproj_bias,
++        )
+         ctx.dt_limit = dt_limit
+         ctx.return_final_states = return_final_states
+         ctx.activation = activation
+@@ -1119,7 +1738,21 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
+     @staticmethod
+     @custom_bwd
+     def backward(ctx, dout, *args):
+-        zxbcdt, conv1d_weight, conv1d_bias, out, A, D, dt_bias, initial_states, seq_idx, rmsnorm_weight, rstd, outproj_weight, outproj_bias = ctx.saved_tensors
++        (
++            zxbcdt,
++            conv1d_weight,
++            conv1d_bias,
++            out,
++            A,
++            D,
++            dt_bias,
++            initial_states,
++            seq_idx,
++            rmsnorm_weight,
++            rstd,
++            outproj_weight,
++            outproj_bias,
++        ) = ctx.saved_tensors
+         dfinal_states = args[0] if ctx.return_final_states else None
+         headdim = ctx.headdim
+         nheads = D.shape[0]
+@@ -1130,21 +1763,34 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
+         assert d_nonssm >= 0
+         recompute_output = outproj_weight is not None
+         if recompute_output:
+-            out_recompute = torch.empty(*out.shape[:2], d_nonssm + dim, device=out.device, dtype=out.dtype)
++            out_recompute = torch.empty(
++                *out.shape[:2], d_nonssm + dim, device=out.device, dtype=out.dtype
++            )
+             out0_recompute, out1_recompute = out_recompute.split([d_nonssm, dim], dim=-1)
+-        zx0, z, xBC, dt = torch.split(zxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
++        zx0, z, xBC, dt = torch.split(
++            zxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1
++        )
+         # Recompute x, B, C
+         xBC_conv = rearrange(
+-            causal_conv1d_cuda.causal_conv1d_fwd(rearrange(xBC, "b s d -> b d s"),
+-                                                 conv1d_weight, conv1d_bias, seq_idx, None, None, ctx.activation in ["silu", "swish"]),
+-            "b d s -> b s d"
++            causal_conv1d_cuda.causal_conv1d_fwd(
++                rearrange(xBC, "b s d -> b d s"),
++                conv1d_weight,
++                conv1d_bias,
++                seq_idx,
++                None,
++                None,
++                ctx.activation in ["silu", "swish"],
++            ),
++            "b d s -> b s d",
+         )
+         x, B, C = torch.split(xBC_conv, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+         x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+         B = rearrange(B, "b l (g n) -> b l g n", g=ctx.ngroups)
+         C = rearrange(C, "b l (g n) -> b l g n", g=ctx.ngroups)
+         dzxbcdt = torch.empty_like(zxbcdt)
+-        dzx0, dz, dxBC_given, ddt_given = torch.split(dzxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1)
++        dzx0, dz, dxBC_given, ddt_given = torch.split(
++            dzxbcdt, [2 * d_nonssm, dim, dim + 2 * ctx.ngroups * dstate, nheads], dim=-1
++        )
+         dxBC = torch.empty_like(xBC)
+         dx, dB, dC = torch.split(dxBC, [dim, ctx.ngroups * dstate, ctx.ngroups * dstate], dim=-1)
+         z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
+@@ -1160,10 +1806,35 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
+         dout = rearrange(dout, "b s (h p) -> b s h p", p=headdim)
+         if rmsnorm_weight is None:
+             dz = rearrange(dz, "b l (h p) -> b l h p", h=nheads)
+-            dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states, *rest = _mamba_chunk_scan_combined_bwd(
+-                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=z, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC, dz=dz, recompute_output=recompute_output
++            dx, ddt, dA, dB, dC, dD, dz, ddt_bias, dinitial_states, *rest = (
++                _mamba_chunk_scan_combined_bwd(
++                    dout,
++                    x,
++                    dt,
++                    A,
++                    B,
++                    C,
++                    out,
++                    ctx.chunk_size,
++                    D=D,
++                    z=z,
++                    dt_bias=dt_bias,
++                    initial_states=initial_states,
++                    dfinal_states=dfinal_states,
++                    seq_idx=seq_idx,
++                    dt_softplus=True,
++                    dt_limit=ctx.dt_limit,
++                    dx=dx,
++                    ddt=ddt_given,
++                    dB=dB,
++                    dC=dC,
++                    dz=dz,
++                    recompute_output=recompute_output,
++                )
++            )
++            out_for_linear = (
++                rearrange(rest[0], "b s h p -> b s (h p)") if recompute_output else None
+             )
+-            out_for_linear = rearrange(rest[0], "b s h p -> b s (h p)") if recompute_output else None
+             drmsnorm_weight = None
+         else:
+             batch = dout.shape[0]
+@@ -1171,12 +1842,47 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
+             dz = rearrange(dz, "b l d -> (b l) d")
+             x_rms = rearrange(out, "b s h p -> (b s) (h p)")
+             z_rms = rearrange(z, "b s h p -> (b s) (h p)")
+-            out1_recompute = rearrange(out1_recompute, "b s d -> (b s) d") if recompute_output else None
+-            dout, drmsnorm_weight, _, dz, *rest = _layer_norm_bwd(dy_rms, x_rms, rmsnorm_weight, None, ctx.rmsnorm_eps, None, rstd, z_rms, norm_before_gate=ctx.norm_before_gate, is_rms_norm=True, recompute_output=recompute_output, dz=dz, out=out1_recompute if recompute_output else None)
++            out1_recompute = (
++                rearrange(out1_recompute, "b s d -> (b s) d") if recompute_output else None
++            )
++            dout, drmsnorm_weight, _, dz, *rest = _layer_norm_bwd(
++                dy_rms,
++                x_rms,
++                rmsnorm_weight,
++                None,
++                ctx.rmsnorm_eps,
++                None,
++                rstd,
++                z_rms,
++                norm_before_gate=ctx.norm_before_gate,
++                is_rms_norm=True,
++                recompute_output=recompute_output,
++                dz=dz,
++                out=out1_recompute if recompute_output else None,
++            )
+             out_for_linear = out_recompute if recompute_output else None
+             dout = rearrange(dout, "(b s) (h p) -> b s h p", b=batch, p=headdim)
+             dx, ddt, dA, dB, dC, dD, _, ddt_bias, dinitial_states = _mamba_chunk_scan_combined_bwd(
+-                dout, x, dt, A, B, C, out, ctx.chunk_size, D=D, z=None, dt_bias=dt_bias, initial_states=initial_states, dfinal_states=dfinal_states, seq_idx=seq_idx, dt_softplus=True, dt_limit=ctx.dt_limit, dx=dx, ddt=ddt_given, dB=dB, dC=dC
++                dout,
++                x,
++                dt,
++                A,
++                B,
++                C,
++                out,
++                ctx.chunk_size,
++                D=D,
++                z=None,
++                dt_bias=dt_bias,
++                initial_states=initial_states,
++                dfinal_states=dfinal_states,
++                seq_idx=seq_idx,
++                dt_softplus=True,
++                dt_limit=ctx.dt_limit,
++                dx=dx,
++                ddt=ddt_given,
++                dB=dB,
++                dC=dC,
+             )
+ 
+         if outproj_weight is not None:
+@@ -1186,16 +1892,63 @@ class MambaSplitConv1dScanCombinedFn(torch.autograd.Function):
+             doutproj_weight, doutproj_bias = None, None
+         dxBC_given = rearrange(dxBC_given, "b s d -> b d s")
+         dxBC_given, dweight, dbias, *_ = causal_conv1d_cuda.causal_conv1d_bwd(
+-            rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias,
+-            rearrange(dxBC, "b s d -> b d s"), seq_idx, None, None, dxBC_given, False, ctx.activation in ["silu", "swish"]
++            rearrange(xBC, "b s d -> b d s"),
++            conv1d_weight,
++            conv1d_bias,
++            rearrange(dxBC, "b s d -> b d s"),
++            seq_idx,
++            None,
++            None,
++            dxBC_given,
++            False,
++            ctx.activation in ["silu", "swish"],
+         )
+         dxBC_given = rearrange(dxBC_given, "b d s -> b s d")
+-        return dzxbcdt, dweight, dbias, ddt_bias, dA, dD, None, dinitial_states, None, None, None, None, drmsnorm_weight, None, doutproj_weight, doutproj_bias, None, None, None
++        return (
++            dzxbcdt,
++            dweight,
++            dbias,
++            ddt_bias,
++            dA,
++            dD,
++            None,
++            dinitial_states,
++            None,
++            None,
++            None,
++            None,
++            drmsnorm_weight,
++            None,
++            doutproj_weight,
++            doutproj_bias,
++            None,
++            None,
++            None,
++        )
+ 
+ 
+-def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states=None, seq_idx=None, dt_limit=(0.0, float("inf")), return_final_states=False, activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
+-    """
+-    Argument:
++def mamba_split_conv1d_scan_combined(
++    zxbcdt,
++    conv1d_weight,
++    conv1d_bias,
++    dt_bias,
++    A,
++    D,
++    chunk_size,
++    initial_states=None,
++    seq_idx=None,
++    dt_limit=(0.0, float("inf")),
++    return_final_states=False,
++    activation="silu",
++    rmsnorm_weight=None,
++    rmsnorm_eps=1e-6,
++    outproj_weight=None,
++    outproj_bias=None,
++    headdim=None,
++    ngroups=1,
++    norm_before_gate=True,
++):
++    """Argument:
+         zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
+         conv1d_weight: (dim + 2 * ngroups * dstate, width)
+         conv1d_bias: (dim + 2 * ngroups * dstate,)
+@@ -1209,15 +1962,52 @@ def mamba_split_conv1d_scan_combined(zxbcdt, conv1d_weight, conv1d_bias, dt_bias
+         outproj_bias: (out_dim,)
+         headdim: if D is 1D, headdim must be passed in
+         norm_before_gate: if True, we do RMSNorm(x) * F.silu(z). If False, we do RMSNorm(x * F.silu(z))
++
+     Return:
+         out: (batch, seqlen, dim)
+     """
+-    return MambaSplitConv1dScanCombinedFn.apply(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, initial_states, seq_idx, dt_limit, return_final_states, activation, rmsnorm_weight, rmsnorm_eps, outproj_weight, outproj_bias, headdim, ngroups, norm_before_gate)
++    return MambaSplitConv1dScanCombinedFn.apply(
++        zxbcdt,
++        conv1d_weight,
++        conv1d_bias,
++        dt_bias,
++        A,
++        D,
++        chunk_size,
++        initial_states,
++        seq_idx,
++        dt_limit,
++        return_final_states,
++        activation,
++        rmsnorm_weight,
++        rmsnorm_eps,
++        outproj_weight,
++        outproj_bias,
++        headdim,
++        ngroups,
++        norm_before_gate,
++    )
+ 
+ 
+-def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A, D, chunk_size, dt_limit=(0.0, float("inf")), activation="silu", rmsnorm_weight=None, rmsnorm_eps=1e-6, outproj_weight=None, outproj_bias=None, headdim=None, ngroups=1, norm_before_gate=True):
+-    """
+-    Argument:
++def mamba_split_conv1d_scan_ref(
++    zxbcdt,
++    conv1d_weight,
++    conv1d_bias,
++    dt_bias,
++    A,
++    D,
++    chunk_size,
++    dt_limit=(0.0, float("inf")),
++    activation="silu",
++    rmsnorm_weight=None,
++    rmsnorm_eps=1e-6,
++    outproj_weight=None,
++    outproj_bias=None,
++    headdim=None,
++    ngroups=1,
++    norm_before_gate=True,
++):
++    """Argument:
+         zxbcdt: (batch, seqlen, 2 * dim + 2 * ngroups * dstate + nheads) where dim == nheads * headdim
+         conv1d_weight: (dim + 2 * ngroups * dstate, width)
+         conv1d_bias: (dim + 2 * ngroups * dstate,)
+@@ -1229,12 +2019,13 @@ def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A,
+         outproj_bias: (out_dim,)
+         headdim: if D is 1D, headdim must be passed in
+         norm_before_gate: if True, we do RMSNorm(x) * F.silu(z). If False, we do RMSNorm(x * F.silu(z))
++
+     Return:
+         out: (batch, seqlen, dim)
+     """
+     if D.dim() == 1:
+         assert headdim is not None
+-        nheads, = D.shape
++        (nheads,) = D.shape
+     else:
+         nheads, headdim = D.shape
+     assert nheads % ngroups == 0
+@@ -1247,20 +2038,39 @@ def mamba_split_conv1d_scan_ref(zxbcdt, conv1d_weight, conv1d_bias, dt_bias, A,
+     if rmsnorm_weight is not None:
+         assert rmsnorm_weight.shape == (dim,)
+     z, xBC, dt = torch.split(zxbcdt, [dim, dim + 2 * ngroups * dstate, nheads], dim=-1)
+-    xBC = rearrange(causal_conv1d_fn(rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias, activation=activation),
+-                    "b d s -> b s d")
++    xBC = rearrange(
++        causal_conv1d_fn(
++            rearrange(xBC, "b s d -> b d s"), conv1d_weight, conv1d_bias, activation=activation
++        ),
++        "b d s -> b s d",
++    )
+     x, B, C = torch.split(xBC, [dim, ngroups * dstate, ngroups * dstate], dim=-1)
+     x = rearrange(x, "b l (h p) -> b l h p", h=nheads)
+     B = rearrange(B, "b l (g n) -> b l g n", g=ngroups)
+     C = rearrange(C, "b l (g n) -> b l g n", g=ngroups)
+     z = rearrange(z, "b l (h p) -> b l h p", h=nheads)
+-    out = ssd_selective_scan(x, dt.to(x.dtype), A, B, C, D=D.float(),
+-                             z=z if rmsnorm_weight is None else None, dt_bias=dt_bias, dt_softplus=True, dt_limit=dt_limit)
++    out = ssd_selective_scan(
++        x,
++        dt.to(x.dtype),
++        A,
++        B,
++        C,
++        D=D.float(),
++        z=z if rmsnorm_weight is None else None,
++        dt_bias=dt_bias,
++        dt_softplus=True,
++        dt_limit=dt_limit,
++    )
+     out = rearrange(out, "b s h p -> b s (h p)")
+     if rmsnorm_weight is not None:
+-        out = rmsnorm_fn(out, rmsnorm_weight, None, z=rearrange(z, "b l h p -> b l (h p)"), eps=rmsnorm_eps,
+-                         norm_before_gate=norm_before_gate)
++        out = rmsnorm_fn(
++            out,
++            rmsnorm_weight,
++            None,
++            z=rearrange(z, "b l h p -> b l (h p)"),
++            eps=rmsnorm_eps,
++            norm_before_gate=norm_before_gate,
++        )
+     if outproj_weight is not None:
+         out = F.linear(out, outproj_weight, outproj_bias)
+     return out
+-
+diff --git a/mamba_calib/ops/triton_onlystate/ssd_chunk_state.py b/mamba_calib/ops/triton_onlystate/ssd_chunk_state.py
+index 53e7d27..0b8ba2c 100644
+--- a/mamba_calib/ops/triton_onlystate/ssd_chunk_state.py
++++ b/mamba_calib/ops/triton_onlystate/ssd_chunk_state.py
+@@ -745,12 +745,23 @@ def _chunk_state_fwd(B, x, dt, dA_cumsum, seq_idx=None, states=None, states_in_f
+     if collect_obs is not None:
+         amax_chp = X_scaled.abs().amax(dim=(0, 2, 1))  # (C,H,P)
+         if (obs := collect_obs.get("x_chp", None)) is not None:
+-            # 기존 옵저버면 obs.update_amax(...) 하나 추가하세요
+             obs.update_amax(amax_chp)
+             b_bckgn = B.view(batch, nchunks, chunk_size, ngroups, dstate)
+             amax_cgn = b_bckgn.abs().amax(dim=(0, 2 , 1))  # (C,G,N)
+             if (obs := collect_obs.get("B_cgn", None)) is not None:
+                 obs.update_amax(amax_cgn)
++        if (obs := collect_obs.get("b_gate_hn", None)) is not None:
++            b_bckgn = B.view(batch, nchunks, chunk_size, ngroups, dstate)
++            nheads_per_g = nheads // ngroups
++            group_idx = torch.arange(nheads, device=B.device) // nheads_per_g
++            b_per_head = b_bckgn[:, :, :, group_idx, :]  # (B,C,K,H,N)
++            gate_bckh1 = scale_bckh1  # (B,C,K,H,1)
++            gated_b = b_per_head * gate_bckh1  # (B,C,K,H,N)
++            amax_hn = gated_b.abs().amax(dim=(0, 1, 2))  # (H,N)
++            obs.update_amax(amax_hn)
++        if (obs := collect_obs.get("ori_x_chp", None)) is not None:
++            ori_amax = X_bcKhd.abs().amax(dim=(0, 1, 2))  # (H,P)
++            obs.update_amax(ori_amax)
+     X_scaled = X_scaled.view(batch, S_total, nheads, headdim)
+     if X_scaled.stride(-1) != 1:
+         X_scaled = X_scaled.contiguous()
+diff --git a/ssdi8/eval_utils/ppl_eval.py b/ssdi8/eval_utils/ppl_eval.py
+index a714116..8ff8ba6 100644
+--- a/ssdi8/eval_utils/ppl_eval.py
++++ b/ssdi8/eval_utils/ppl_eval.py
+@@ -50,7 +50,8 @@ def get_eval_loaders(name, tokenizer, seqlen=2048):
+             split="train",
+         )
+         valdata.shuffle(seed=42)
+-        tokenizer.pad_token = tokenizer.eos_token
++        if hasattr(tokenizer, 'eos_token'):
++            tokenizer.pad_token = tokenizer.eos_token
+         valenc = tokenizer(' '.join(valdata[:1100]["text"]), return_tensors="pt")
+         valenc = valenc.input_ids[:, :(256 * seqlen)]
+         valenc = TokenizerWrapper(valenc)
+diff --git a/ssdi8/hadamard_utils.py b/ssdi8/hadamard_utils.py
+index a5c842d..bd46afc 100644
+--- a/ssdi8/hadamard_utils.py
++++ b/ssdi8/hadamard_utils.py
+@@ -12,12 +12,10 @@ def is_pow2(n):
+ 
+ def get_had_fn(dim):
+     had_scale = 1.0 / math.sqrt(dim) # hadamard transform scaling factor
+-    if dim % 12 == 0:
+-        assert (is_pow2(dim // 12))
++    if dim % 12 == 0 and is_pow2(dim // 12):
+         N = 12
+         transform_fn = fast_hadamard_transform_cuda.fast_hadamard_transform_12N
+-    elif dim % 40 == 0:
+-        assert (is_pow2(dim // 40))
++    elif dim % 40 == 0 and is_pow2(dim // 40):
+         N = 40
+         transform_fn = fast_hadamard_transform_cuda.fast_hadamard_transform_40N
+     else:
+@@ -37,14 +35,24 @@ def had_transform(w):
+ 
+ def get_qhad_fn(dim):
+     had_scale = 1.0 / math.sqrt(dim) # hadamard transform scaling factor
+-    if dim % 12 == 0:
+-        assert (is_pow2(dim // 12))
++    # Branch order must match get_had_fn (12N -> 40N -> pow2): the weight fold
++    # uses get_had_fn, so any dim matching both 20N/28N and 40N (e.g. 5120 =
++    # Mamba-2 2.7B d_inner) must pick 40N here too, or the runtime activation
++    # transform (H_20N) fails to cancel the H_40N folded into out_proj.weight
++    # -> scrambled outputs (WT2 PPL ~1.6e9 at 2.7B). Dims matching ONLY 20N/28N
++    # already assert-fail in get_had_fn at fold time, so this order is safe.
++    if dim % 12 == 0 and is_pow2(dim // 12):
+         N = 12
+         transform_fn = quant_hadamard.fast_hadamard_transform_12N
+-    elif dim % 40 == 0:
+-        assert (is_pow2(dim // 40))
++    elif dim % 40 == 0 and is_pow2(dim // 40):
+         N = 40
+         transform_fn = quant_hadamard.fast_hadamard_transform_40N
++    elif dim % 20 == 0 and is_pow2(dim // 20):
++        N = 20
++        transform_fn = quant_hadamard.fast_hadamard_transform_20N
++    elif dim % 28 == 0 and is_pow2(dim // 28):
++        N = 28
++        transform_fn = quant_hadamard.fast_hadamard_transform_28N
+     else:
+         assert (is_pow2(dim))
+         N = 2
+diff --git a/ssdi8/megatron_utils.py b/ssdi8/megatron_utils.py
+index c437c0a..7452e89 100644
+--- a/ssdi8/megatron_utils.py
++++ b/ssdi8/megatron_utils.py
+@@ -10,14 +10,17 @@ import os
+ import torch
+ import sentencepiece
+ from sentencepiece import sentencepiece_model_pb2 as spm_pb2
+-from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
++try:
++    from megatron.core.datasets.megatron_tokenizer import MegatronTokenizer
++except (ImportError, ModuleNotFoundError):
++    MegatronTokenizer = object  # placeholder for non-8b models
+ 
+ 
+ class _SentencePieceTokenizer(MegatronTokenizer):
+     """SentencePieceTokenizer-Megatron wrapper"""
+ 
+     def __init__(self, model_file, vocab_extra_ids=0):
+-        super().__init__(model_file, vocab_extra_ids=vocab_extra_ids)
++        super().__init__() if MegatronTokenizer is object else super().__init__(model_file, vocab_extra_ids=vocab_extra_ids)
+         self.model_file = model_file
+         self.tokenizer = sentencepiece.SentencePieceProcessor(model_file=model_file)
+         self._initalize(vocab_extra_ids)
+diff --git a/ssdi8/modelutils_mamba.py b/ssdi8/modelutils_mamba.py
+index 27191d6..b64ec02 100644
+--- a/ssdi8/modelutils_mamba.py
++++ b/ssdi8/modelutils_mamba.py
+@@ -127,10 +127,11 @@ def run_calibration(
+         x_col = ChunkCollector(div=127.0, device=next(mixer.parameters()).device)
+         ori_x_col = ChunkCollector(div=127.0, device=next(mixer.parameters()).device)
+         B_col = ChunkCollector(div=127.0, device=next(mixer.parameters()).device)
++        b_gate_col = ChunkCollector(div=1.0, device=next(mixer.parameters()).device)
+         C_cali = ChunkCollector(div=127.0, device=next(mixer.parameters()).device)
+         state_cali = ChunkCollector(div=127.0, device=next(mixer.parameters()).device)
+         cb_cali = ChunkCollector(div=127.0, device=next(mixer.parameters()).device)
+-        
++
+         ##DO
+         _ssd_col = _ChannelMeanCollector()
+         _out_col = _ChannelMeanCollector()
+@@ -143,12 +144,12 @@ def run_calibration(
+         )
+         fp_proj_mean_hooks[f"L{i}/ssd_out"] = (_ssd_col, h_ssd)
+         fp_proj_mean_hooks[f"L{i}/out_proj_out"] = (_out_col, h_out)
+-        
++
+         ### COMP ###
+ 
+ 
+         # mixer에 달아두기 → forward에서 collect_obs로 전달됨
+-        mixer._collect_obs = {"ori_x_chp": ori_x_col,"x_chp": x_col, "B_cgn": B_col,"C_cali":C_cali,"state_cali":state_cali,"cb_cali":cb_cali}
++        mixer._collect_obs = {"ori_x_chp": ori_x_col,"x_chp": x_col, "B_cgn": B_col,"b_gate_hn": b_gate_col,"C_cali":C_cali,"state_cali":state_cali,"cb_cali":cb_cali}
+         for name, m in mixer.named_modules():
+             if is_calib_ops(m):
+                 # FIXME(HY): hardcode everything for now
+@@ -237,6 +238,7 @@ def run_calibration(
+                 act_scales[i]["chunk_state:x_scale_chp"] = col["x_chp"].get_scale()  # (C,H,P)
+                 act_scales[i]["chunk_state:ori_x_scale_chp"] = col["ori_x_chp"].get_scale()  # (C,H,P)
+                 act_scales[i]["chunk_state:B_scale_cgn"] = col["B_cgn"].get_scale()  # (C,G,N)
++                act_scales[i]["chunk_state:b_gate_scale_hn"] = col["b_gate_hn"].get_scale()  # (H,N)
+                 act_scales[i]["chunk_scan:C_scale"] = col["C_cali"].get_scale()  # (C,H,P)
+                 act_scales[i]["chunk_scan:cb_scale"] = col["cb_cali"].get_scale()  # (C,H,P)
+                 act_scales[i]["ssd_combined:state_scale"] = col["state_cali"].get_scale()  # (C,H,P)
+@@ -675,6 +677,10 @@ def mamba_sequential_compensation_ssdout(
+         blocks[li] = layer.cpu(); torch.cuda.empty_cache()
+         inps_list, res_in_list = next_inps, next_res
+ 
++    # Stash to a persistent attribute so the post-mixer-swap keyside
++    # compensation recalibration can reuse the FP out_proj-output means
++    # captured here. The original clear is preserved.
++    model._fp_means_persistent = fp_means
+     model._fp_means = None
+     return model
+ 
+diff --git a/ssdi8/qLinearLayer.py b/ssdi8/qLinearLayer.py
+index d891fd1..a4b0fcf 100644
+--- a/ssdi8/qLinearLayer.py
++++ b/ssdi8/qLinearLayer.py
+@@ -3,6 +3,8 @@ This file is a modified version of the original file from the Quamba repo.
+ https://github.com/enyac-group/Quamba
+ """
+ 
++import os
++
+ import torch
+ import torch.nn as nn
+ import torch.nn.functional as F
+@@ -443,8 +445,19 @@ class W4A8B8O8LinearParallel(torch.nn.Module):
+         
+         self.pad_out = 0
+         self.size_n, self.size_k = out_features, in_features
+-        if self.size_n % 64 != 0:                             #N이 64의 배수여얗미  
+-            self.pad_out = 64 - self.size_n % 64
++        # Marlin picks its N-tile from the divisors of size_n. Padding only to 64
++        # can strand a shape on thread_n=64, its narrowest (and slowest) config:
++        # Mamba-2 1.3B d_in_proj = 8512 = 64*133 with 133 odd, which measures
++        # 1.52x slower than the same GEMM at 8704 = 256*34. 2.7B/8B in_proj land
++        # on thread_n=128 and lose 1.11-1.15x. See docs/audit/06_linear_swap.md L-3.
++        # On by default. Safe because (a) the output is bit-identical -- the
++        # padded columns are sliced off -- and (b) every latency figure in the
++        # paper measures the *recurrence* region, which excludes in_proj and
++        # out_proj (see the LinQuant bench scripts), so no published
++        # number moves. Set SSDI8_PAD256=0 to restore 64-alignment.
++        _align = 64 if os.environ.get("SSDI8_PAD256", "1") == "0" else 256
++        if self.size_n % _align != 0:
++            self.pad_out = _align - self.size_n % _align
+         self.size_n = self.size_n + self.pad_out
+ 
+         self.max_par = 16
+@@ -564,8 +577,19 @@ class W4A8B16O16LinearParallel(torch.nn.Module):
+         
+         self.pad_out = 0
+         self.size_n, self.size_k = out_features, in_features
+-        if self.size_n % 64 != 0:                             #N이 64의 배수여얗미  
+-            self.pad_out = 64 - self.size_n % 64
++        # Marlin picks its N-tile from the divisors of size_n. Padding only to 64
++        # can strand a shape on thread_n=64, its narrowest (and slowest) config:
++        # Mamba-2 1.3B d_in_proj = 8512 = 64*133 with 133 odd, which measures
++        # 1.52x slower than the same GEMM at 8704 = 256*34. 2.7B/8B in_proj land
++        # on thread_n=128 and lose 1.11-1.15x. See docs/audit/06_linear_swap.md L-3.
++        # On by default. Safe because (a) the output is bit-identical -- the
++        # padded columns are sliced off -- and (b) every latency figure in the
++        # paper measures the *recurrence* region, which excludes in_proj and
++        # out_proj (see the LinQuant bench scripts), so no published
++        # number moves. Set SSDI8_PAD256=0 to restore 64-alignment.
++        _align = 64 if os.environ.get("SSDI8_PAD256", "1") == "0" else 256
++        if self.size_n % _align != 0:
++            self.pad_out = _align - self.size_n % _align
+         self.size_n = self.size_n + self.pad_out
+ 
+         self.max_par = 16
+diff --git a/ssdi8/qMamba2.py b/ssdi8/qMamba2.py
+index 4e18809..eaa6364 100644
+--- a/ssdi8/qMamba2.py
++++ b/ssdi8/qMamba2.py
+@@ -66,6 +66,9 @@ def get_group_params(scales, ngroups, device):
+     else:
+         return None, None, scales.to(device)
+ 
++_DQK = None  # ours: {layer_idx: (D⁻¹ for B, D for C)} flattened (G·N), applied at the conv output BEFORE the B/C observers
++
++
+ class Mamba2Simple(nn.Module):
+     def __init__(
+         self,
+@@ -228,6 +231,10 @@ class Mamba2Simple(nn.Module):
+                 seq_idx=seq_idx,
+             ).transpose(1, 2)
+         x, B, C = torch.split(xBC, [self.d_ssm, self.ngroups * self.d_state, self.ngroups * self.d_state], dim=-1)
++        if _DQK is not None and self.layer_idx in _DQK:  # ours: diagonal key scaling C·D, B·D⁻¹ (exact), seen by every observer downstream
++            _db, _dc = _DQK[self.layer_idx]
++            B = B * _db.to(B.device, B.dtype)
++            C = C * _dc.to(C.device, C.dtype)
+         x = self.x_conv_out(x) # ActIdentity
+         B = self.B_conv_out(B) # ActIdentity
+         C = self.C_conv_out(C) # ActIdentity
+@@ -482,7 +489,9 @@ class W4A8QMamba2(nn.Module):
+             state_chunkscan_scale=act_scales["ssd_combined:state_scale"],
+             dt_limit=originalLayer.dt_limit
+         )
+-        
++        if "chunk_state:b_gate_scale_hn" in act_scales:
++            qmixer.qchunk_scan.b_gate_scale_hn = act_scales["chunk_state:b_gate_scale_hn"]
++
+         # Norm
+         assert originalLayer.rmsnorm, "Only support Mamba2 block with rmsnorm"
+         qmixer.norm = QRMSNormGated.from_fp16(
+@@ -813,6 +822,8 @@ class W8A8QMamba2(nn.Module):
+             state_chunkscan_scale=act_scales["ssd_combined:state_scale"],
+             dt_limit=originalLayer.dt_limit
+         )
++        if "chunk_state:b_gate_scale_hn" in act_scales:
++            qmixer.qchunk_scan.b_gate_scale_hn = act_scales["chunk_state:b_gate_scale_hn"]
+         assert qmixer.rmsnorm, "Only support Mamba2 block with rmsnorm"
+         qmixer.norm = QRMSNormGated.from_fp16(
+                         originalLayer.norm,
+diff --git a/ssdi8/triton/fp16_ssd_ops.py b/ssdi8/triton/fp16_ssd_ops.py
+new file mode 100644
+index 0000000..9ab9393
+--- /dev/null
++++ b/ssdi8/triton/fp16_ssd_ops.py
+@@ -0,0 +1,200 @@
++"""
++FP16 reference implementations of SSD sub-operations for precision ablation.
++
++These are PyTorch-level wrappers that correctly handle SSDi8's INT8 scale
++conventions. They DON'T modify any existing Triton kernels — they just provide
++alternative implementations that can be swapped in via module-level flags in
++quant_ssd_combined.py.
++
++Each function takes the SAME inputs as its INT8 counterpart and produces
++outputs compatible with the NEXT stage in the pipeline.
++"""
++
++import torch
++from einops import rearrange
++
++
++@torch.no_grad()
++def fp16_state_passing(states_int8, state_scale_hp, dA_chunk_cumsum,
++                       initial_states=None, seq_idx=None, chunk_size=None,
++                       out_dtype=torch.float16):
++    """FP16 state passing — replaces Q0.7 fixedpoint.
++
++    Takes INT8 states from _quant_chunk_state_fwd, dequantizes them,
++    runs the recurrence in FP32, and returns FP16 states + scales for
++    downstream chunk_scan to dequantize.
++
++    Args:
++        states_int8: (batch, nchunks, nheads, headdim*dstate) INT8 from chunk_state
++        state_scale_hp: (nheads, headdim) per-(H,P) state scales
++        dA_chunk_cumsum: (batch, nheads, nchunks) last cumsum per chunk
++        initial_states: (batch, nheads, headdim*dstate) or None
++    Returns:
++        states_int8: (batch, nchunks, nheads, dim) INT8 — requantized for chunk_scan
++        final_states: (batch, nheads, dim) INT8
++    """
++    batch, nchunks, nheads, dim = states_int8.shape
++    device = states_int8.device
++
++    # Dequantize states: int8 → float using state_scale
++    # state_scale_hp is (H, P), states are (batch, nchunks, H, P*N) flattened
++    # We need to figure out headdim and dstate from dim and scale shape
++    headdim = state_scale_hp.shape[-1]
++    dstate = dim // headdim
++
++    # Reshape for dequant: (batch, nchunks, H, P, N)
++    s_reshaped = states_int8.view(batch, nchunks, nheads, headdim, dstate).float()
++    scale = state_scale_hp.float().to(device)  # (H, P)
++    # Dequant: value = int8_val * scale[h, p]
++    s_fp = s_reshaped * scale[None, None, :, :, None]  # broadcast over batch, chunk, dstate
++
++    # Flatten back to (batch, nchunks, nheads, dim)
++    s_fp = s_fp.reshape(batch, nchunks, nheads, dim)
++
++    # Dequant initial states if present
++    init_fp = None
++    if initial_states is not None:
++        init_reshaped = initial_states.view(batch, nheads, headdim, dstate).float()
++        init_fp = (init_reshaped * scale[None, :, :, None]).reshape(batch, nheads, dim)
++
++    # Run recurrence in FP32
++    out_fp = torch.empty_like(s_fp, dtype=torch.float32)
++    if init_fp is not None:
++        running = init_fp.clone()
++    else:
++        running = torch.zeros(batch, nheads, dim, device=device, dtype=torch.float32)
++
++    for c in range(nchunks):
++        gate = torch.exp(dA_chunk_cumsum[:, :, c]).unsqueeze(-1)  # (batch, nheads, 1)
++        new_state = s_fp[:, c]  # (batch, nheads, dim)
++        running = gate * running + new_state
++        out_fp[:, c] = running
++
++    final_fp = running
++
++    # Requantize to INT8 for downstream chunk_scan (which expects INT8 states)
++    # Use same state_scale for requant
++    out_reshaped = out_fp.view(batch, nchunks, nheads, headdim, dstate)
++    inv_scale = 1.0 / scale.clamp(min=1e-12)  # (H, P)
++    out_scaled = out_reshaped * inv_scale[None, None, :, :, None]
++    out_int8 = out_scaled.round().clamp(-127, 127).to(torch.int8)
++    out_int8 = out_int8.reshape(batch, nchunks, nheads, dim)
++
++    final_reshaped = final_fp.view(batch, nheads, headdim, dstate)
++    final_scaled = final_reshaped * inv_scale[None, :, :, None]
++    final_int8 = final_scaled.round().clamp(-127, 127).to(torch.int8)
++    final_int8 = final_int8.reshape(batch, nheads, dim)
++
++    return out_int8, final_int8
++
++
++@torch.no_grad()
++def fp32_state_passing_dequant(states_int8, state_scale_hp, dA_chunk_cumsum,
++                                initial_states_int8=None):
++    """Proper FP32 state passing: dequant → FP32 recurrence → requant.
++
++    Unlike int8_state_passing_fp32_arith which operates on raw INT8 values,
++    this function dequantizes states to their true FP32 magnitudes using the
++    calibrated state scale, accumulates in FP32 (matching our pipeline's
++    approach), and re-quantizes using the same scale for chunk_scan.
++
++    Args:
++        states_int8: (batch, nchunks, nheads, headdim*dstate) INT8
++        state_scale_hp: (nheads, headdim) per-(H,P) state scales
++        dA_chunk_cumsum: (batch, nheads, nchunks) last cumsum per chunk
++        initial_states_int8: (batch, nheads, headdim*dstate) INT8 or None
++    Returns:
++        out_int8: (batch, nchunks, nheads, dim) INT8
++        final_int8: (batch, nheads, dim) INT8
++    """
++    batch, nchunks, nheads, dim = states_int8.shape
++    device = states_int8.device
++    headdim = state_scale_hp.shape[-1]
++    dstate = dim // headdim
++
++    # Build per-element scale: (H, P) → (H, P*N) by repeating along N
++    # states are stored as (batch, nchunks, H, P*N) where P*N = headdim*dstate
++    scale_hp = state_scale_hp.float().to(device)  # (H, P)
++    scale_flat = scale_hp.unsqueeze(-1).expand(-1, -1, dstate).reshape(nheads, dim)
++    # scale_flat: (H, P*N) — broadcast over batch, chunk
++
++    # Dequantize all chunk states to FP32
++    states_fp = states_int8.float() * scale_flat[None, None, :, :]  # (B, C, H, P*N)
++
++    # Dequantize initial states
++    if initial_states_int8 is not None:
++        running = initial_states_int8.float() * scale_flat[None, :, :]  # (B, H, P*N)
++    else:
++        running = torch.zeros(batch, nheads, dim, device=device, dtype=torch.float32)
++
++    # FP32 recurrence — accumulator stays in full precision
++    # Output convention matches Q0.7: out[c] = state ENTERING chunk c
++    #   out[0] = initial_state (before any recurrence)
++    #   out[c] = gate * out[c-1] + chunk_states[c-1]  (result after processing chunk c-1)
++    # chunk_scan reads prev_states[c] as the state entering chunk c.
++    inv_scale = (1.0 / scale_flat.clamp(min=1e-12))  # (H, P*N)
++    out_int8 = torch.empty_like(states_int8)
++
++    # Store initial state as out[0]
++    out_int8[:, 0] = (running * inv_scale[None]).round().clamp(-127, 127).to(torch.int8)
++
++    for c in range(nchunks):
++        gate = torch.exp(dA_chunk_cumsum[:, :, c]).unsqueeze(-1)  # (B, H, 1)
++        running = gate * running + states_fp[:, c]
++        if c < nchunks - 1:
++            out_int8[:, c + 1] = (running * inv_scale[None]).round().clamp(-127, 127).to(torch.int8)
++
++    final_int8 = (running * inv_scale[None]).round().clamp(-127, 127).to(torch.int8)
++
++    return out_int8, final_int8
++
++
++@torch.no_grad()
++def int8_state_passing_fp32_arith(states_int8, dA_chunk_cumsum,
++                                   initial_states_int8=None):
++    """FP32-arithmetic state passing on INT8 states.
++
++    Matches Q0.7 kernel structure exactly:
++    - s32 accumulates WITHOUT clamping between iterations (like Q0.7's INT32 accum)
++    - out[0] = clamp(initial_state) (stored before loop, like Q0.7 line 76-77)
++    - Loop: s32 = gate * s32 + new_state, then clamp to INT8 for output only
++    - Only difference: gate * s32 uses FP32 multiply instead of fixedpoint shift
++
++    Args:
++        states_int8: (batch, nchunks, nheads, dim) INT8 — from chunk_state (reshaped)
++        dA_chunk_cumsum: (batch, nheads, nchunks) — last cumsum value per chunk
++        initial_states_int8: (batch, nheads, dim) INT8 or None
++    Returns:
++        out_int8: (batch, nchunks, nheads, dim) INT8
++        final_int8: (batch, nheads, dim) INT8
++    """
++    batch, nchunks, nheads, dim = states_int8.shape
++    device = states_int8.device
++
++    out = torch.empty(batch, nchunks, nheads, dim, device=device, dtype=torch.int8)
++
++    # Initialize s32 accumulator (matches Q0.7 kernel lines 68-73)
++    if initial_states_int8 is not None:
++        s32 = initial_states_int8.float()  # (batch, nheads, dim) — NOT clamped
++    else:
++        s32 = torch.zeros(batch, nheads, dim, device=device, dtype=torch.float32)
++
++    # Store first output = clamp(s32) BEFORE loop (matches Q0.7 kernel lines 76-77)
++    out[:, 0] = s32.round().clamp(-127, 127).to(torch.int8)
++
++    # Loop: process chunks (matches Q0.7 kernel lines 81-116)
++    for c in range(nchunks):
++        new_s = states_int8[:, c].float()  # (batch, nheads, dim)
++        gate = torch.exp(dA_chunk_cumsum[:, :, c]).unsqueeze(-1)  # (batch, nheads, 1)
++
++        # FP32 gate multiply (vs Q0.7: (s32 * gate_q + S//2) >> SHIFT)
++        # s32 stays in FP32 — NOT clamped between iterations
++        s32 = gate * s32 + new_s
++
++        # Store clamped output (but s32 itself stays unclamped)
++        if c < nchunks - 1:
++            out[:, c + 1] = s32.round().clamp(-127, 127).to(torch.int8)
++
++    # Final state
++    final = s32.round().clamp(-127, 127).to(torch.int8)
++    return out, final
+diff --git a/vllm_kernel_patch.py b/vllm_kernel_patch.py
+new file mode 100755
+index 0000000..607b295
+--- /dev/null
++++ b/vllm_kernel_patch.py
+@@ -0,0 +1,74 @@
++"""Replace SSDi8's Marlin QQQ W4A8 kernel with vLLM's version.
++
++Import this BEFORE loading the quantized model. It monkey-patches
++quant_linear_cuda.w4a8o16_gemm to use vLLM's marlin_qqq_gemm. Upstream SSDi8's QQQ kernel
++has a shared-memory hazard that produces wrong results on SM 9.0 (H100); vLLM's copy is
++fixed. Both SSDi8's and LinQuant's W4A8 linears then run the same GEMM.
++"""
++
++import os
++import sys
++
++import torch
++
++# This file lives in `libs/SSDi8/` of the LinQuant repo.
++_REPO = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
++
++# vLLM's marlin_qqq kernel, built as a standalone extension: `cd csrc/marlin_qqq && pip install .`
++# or `python setup.py build_ext --inplace` (then MARLIN_QQQ_DIR or the default dir below).
++sys.path.insert(0, os.environ.get("MARLIN_QQQ_DIR", os.path.join(_REPO, "csrc", "marlin_qqq")))
++import marlin_qqq
++
++# SSDi8's compiled quant_linear_cuda (the module whose function we replace).
++sys.path.insert(0, os.path.join(_REPO, "libs", "SSDi8"))
++import quant_linear_cuda
++
++# Fused FP16->INT8 quantizer (one Triton kernel, FP32 internally, IEEE round-to-nearest divide).
++from linquant.w4a8_linear import _fused_fp16_to_int8
++
++
++def _vllm_w4a8o16_gemm(
++    x, weight, input_scale, s_channel, s_group, workspace, size_m, size_n, size_k, output_transpose
++):
++    """Drop-in replacement using vLLM's marlin_qqq_gemm."""
++    # SSDi8's kernel takes FP16 x and does INT8 quant internally.
++    # vLLM's kernel takes INT8 x directly.
++    # So we need to quantize x to INT8 here.
++    if x.dtype != torch.int8:
++        if input_scale.numel() == 1:
++            # Per-tensor scale. SSDi8's native kernel quantizes FP16→INT8 inside
++            # CUDA; vLLM's takes INT8, so the conversion happens here. Doing it
++            # with elementwise torch ops costs ~5 full passes over x in FP32
++            # (67 MB → 134 MB per pass at prefill shapes) and measured
++            # +795 us/layer on Mamba-2 1.3B, B=8, T=2048 — see
++            # docs/audit/04_inefficiencies.md I-2. The fused Triton kernel is
++            # bit-exact with the chain it replaces.
++            scale = input_scale.float().clamp(min=1e-12)
++            x_2d = x.reshape(-1, x.shape[-1])
++            x_q = _fused_fp16_to_int8(x_2d, scale, clamp_min=-128.0, reciprocal=False)
++            x_q = x_q.view(x.shape)
++            s_tok = scale.expand(x.shape[0]).contiguous()
++        else:
++            # Per-token scale
++            scale = x.abs().amax(dim=-1, keepdim=True).float() / 127.0
++            scale = scale.clamp(min=1e-12)
++            x_q = (x.float() / scale).round().clamp(-128, 127).to(torch.int8)
++            s_tok = scale.squeeze(-1).contiguous()
++    else:
++        x_q = x
++        s_tok = (
++            input_scale.expand(x.shape[0]) if input_scale.numel() == 1 else input_scale
++        ).contiguous()
++
++    out = marlin_qqq.marlin_qqq_gemm(
++        x_q, weight, s_tok, s_channel, s_group, workspace, size_m, size_n, size_k
++    )
++
++    if output_transpose:
++        out = out.t().contiguous()
++
++    return out
++
++
++quant_linear_cuda.w4a8o16_gemm = _vllm_w4a8o16_gemm
++print("[vllm_kernel_patch] Replaced w4a8o16_gemm with vLLM's marlin_qqq_gemm")
