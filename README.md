@@ -1,4 +1,4 @@
-[![Paper](https://img.shields.io/badge/Paper-arXiv-b31b1b.svg)](TODO-arxiv-link)
+[![Paper](https://img.shields.io/badge/arXiv-2610.39418-b31b1b.svg)](https://arxiv.org/abs/2610.39418)
 
 # LinQuant: Functional Invariances for Low-Precision Linear Recurrences
 
@@ -124,7 +124,15 @@ The controlled study uses models that differ only in their sequence mixer (linea
 ## Citation
 
 ```bibtex
-TODO
+@misc{tumma2026linquant,
+      title={LinQuant: Functional Invariances for Low-Precision Linear Recurrences},
+      author={Neehal Tumma and Philipp Nazari and Rohan Cherukuri and Daniela Rus and T. Konstantin Rusch},
+      year={2026},
+      eprint={2610.39418},
+      archivePrefix={arXiv},
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2610.39418},
+}
 ```
 
 ## Dependencies
