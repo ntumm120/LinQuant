@@ -4,7 +4,7 @@
 
 **LinQuant** quantizes the chunkwise prefill of linear recurrences (linear attention, Mamba-2, GLA, DeltaNet, Gated DeltaNet, KDA) by exploiting *functional invariances*: transformations that leave the full-precision recurrence unchanged while making the quantized operands easier to represent. The framework covers seven such invariances, including rotations and diagonal rescalings of the key and value axes and alternative placements of the recurrent decay and write factors, and it is applied on top of [SSDi8](https://github.com/cau-hai-lab/SSDi8), an INT8 prefill pipeline for Mamba-2, to produce W4A8 Mamba-2 and Nemotron-H models with INT8 recurrent states.
 
-This repository contains everything needed to reproduce the paper's main-text results: the fake-quantized reference recurrence and the mixer-zoo harness, the INT8 Triton kernels used for timing, and the Mamba-2 / Nemotron-H W4A8 production path.
+This repository contains the code behind the paper's main-text results: the fake-quantized reference recurrence and the zoo harness of the controlled study, the INT8 Triton kernels used for timing, and the Mamba-2 / Nemotron-H W4A8 production path. The production and timing results are reproducible from public weights; the models of the controlled study are not released (see [Mixer zoo](#mixer-zoo)).
 
 ```
 linquant/
@@ -12,7 +12,7 @@ linquant/
                       diagonal rescalings, INT8 stored state; the single source of truth for the invariances
   invariances.py      fake quantizers: static per-role scales (per tensor / head / channel), the realizable
                       kernel policies kernel_static, kernel_pt, kernel_ptk
-  harness.py, run.py  patch a mixer-zoo model to run its recurrence through reference.py, calibrate, eval WikiText-2
+  harness.py, run.py  patch a zoo model to run its recurrence through reference.py, calibrate, eval WikiText-2
   kernels/zoo/        INT8 chunk kernels for linear attention, GLA, DeltaNet, Gated DeltaNet, KDA (FLA structure)
   kernels/mamba2/     INT8 Mamba-2 SSD kernels (value-side and key-side absorption, INT8 state passing)
   quantized_mamba2.py our W4A8 Mamba-2 mixer; w4a8_linear.py, marlin_utils.py: W4A8 linears on the Marlin GEMM
@@ -50,7 +50,7 @@ nvcc needs a host gcc it supports (CUDA 12.8: gcc <= 13). If your environment's 
 
 ### Controlled study: invariances with fake quantization (Section 4)
 
-The zoo models (340M and 1.3B, one cell per sequence mixer) come from the [mixer zoo](#mixer-zoo); the harness imports that repo's modelling code and loads its checkpoints:
+The zoo models (340M and 1.3B, one cell per sequence mixer) are not part of this release (see [Mixer zoo](#mixer-zoo)). The harness is included so the exact quantized computation behind every zoo number can be read and tested; `reference.py` and the kernel tests run without any model. Running the harness itself needs the zoo modelling code and checkpoints:
 
 ```bash
 export MIXERZOO_REPO=/path/to/mixer-zoo-checkout
@@ -112,7 +112,7 @@ Nemotron-H 8B (Mamba-2 mixers interleaved with attention and MLP blocks) is quan
 
 ## Mixer zoo
 
-The controlled study uses models that differ only in their sequence mixer (linear attention with no, scalar, or diagonal decay, each with and without a write gate, plus DeltaNet, Gated DeltaNet, and KDA), trained with the [mixer-zoo repository](https://github.com/phnazari/LinQuant). The `*_nonorm` cells of the appendix need that repository's `qk_norm="none"` option.
+The controlled study uses models that differ only in their sequence mixer (linear attention with no, scalar, or diagonal decay, each with and without a write gate, plus DeltaNet, Gated DeltaNet, and KDA), trained by us at 340M and 1.3B parameters. These checkpoints and their training code are not released. Everything the harness does to a model is in `linquant/harness.py` (which recurrence tensors are intercepted and how they are routed through `reference.py`), so the study can be rerun on any model exposing the same Q/K/V/decay/gate tensors.
 
 ## Notes
 
