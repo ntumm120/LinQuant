@@ -27,19 +27,21 @@ csrc/marlin_qqq       Marlin QQQ W4A8 GEMM (from vLLM), built as a standalone ex
 
 Tested with Python 3.11, CUDA 12.8, torch 2.8.0, triton 3.4.0 on H100 (perplexity) and A5000 (timing).
 
-Clone, fetch the SSDi8 submodule (without its own nested submodules, which the build does not need), and apply our patch to it (calibration hooks for the rotation and key rescaling, the Marlin W4A8 projections, an H100 build fix, and one numerical fix described under [Notes](#notes)):
+Clone, fetch the SSDi8 submodule and the two of its nested submodules the build needs (CUTLASS headers and fast-hadamard-transform), and apply our patch to SSDi8 (calibration hooks for the rotation and key rescaling, the Marlin W4A8 projections, an H100 build fix, and one numerical fix described under [Notes](#notes)):
 
 ```bash
 git clone https://github.com/ntumm120/LinQuant.git && cd LinQuant
 git submodule update --init libs/SSDi8
+git -C libs/SSDi8 submodule update --init 3rdparty/cutlass 3rdparty/fast-hadamard-transform
 git -C libs/SSDi8 apply ../../patches/ssdi8.patch
 ```
 
-Install the package and build the two CUDA extensions:
+Install the package and build the CUDA extensions (the PyPI source package of fast-hadamard-transform is incomplete, so it is built from the submodule):
 
 ```bash
 pip install -e .                                                         # pins torch, triton, fla-core, mamba-ssm, causal-conv1d, transformers
-cd libs/SSDi8 && pip install . --no-build-isolation && cd ../..          # SSDi8 extensions (quant_linear_cuda, quant_hadamard, fast_hadamard_transform)
+pip install --no-build-isolation libs/SSDi8/3rdparty/fast-hadamard-transform
+cd libs/SSDi8 && pip install . --no-build-isolation && cd ../..          # SSDi8 extensions (quant_linear_cuda, quant_hadamard, ...)
 cd csrc/marlin_qqq && python setup.py build_ext --inplace && cd ../..    # Marlin W4A8 GEMM (sm80 / sm86 / sm90)
 ```
 
