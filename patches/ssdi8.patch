@@ -2089,18 +2089,19 @@ index 53e7d27..0b8ba2c 100644
      if X_scaled.stride(-1) != 1:
          X_scaled = X_scaled.contiguous()
 diff --git a/setup.py b/setup.py
-index 12ebb32..2e96cd6 100755
+index 12ebb32..25aadae 100755
 --- a/setup.py
 +++ b/setup.py
-@@ -193,6 +193,7 @@ ext_modules.append(
+@@ -193,6 +193,8 @@ ext_modules.append(
          include_dirs=[
              Path(this_dir) / "csrc" / "linear",
              Path(this_dir) / "3rdparty" / "cutlass" / "build" / "install" / "include",
 +            Path(this_dir) / "3rdparty" / "cutlass" / "include",  # header-only: no cmake install needed
++            Path(this_dir) / "3rdparty" / "cutlass" / "tools" / "util" / "include",
          ],
      )
  )
-@@ -349,9 +350,10 @@ ext_modules.append(
+@@ -349,9 +351,10 @@ ext_modules.append(
  
  
  def get_package_version():
