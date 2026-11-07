@@ -2088,6 +2088,24 @@ index 53e7d27..0b8ba2c 100644
      X_scaled = X_scaled.view(batch, S_total, nheads, headdim)
      if X_scaled.stride(-1) != 1:
          X_scaled = X_scaled.contiguous()
+diff --git a/setup.py b/setup.py
+index 12ebb32..207410d 100755
+--- a/setup.py
++++ b/setup.py
+@@ -349,9 +349,10 @@ ext_modules.append(
+ 
+ 
+ def get_package_version():
+-    with open(Path(this_dir) / "quamba" / "__init__.py", "r") as f:
+-        version_match = re.search(r"^__version__\s*=\s*(.*)$", f.read(), re.MULTILINE)
+-    public_version = ast.literal_eval(version_match.group(1))
++    # Upstream reads the version from a quamba/__init__.py that the repository does not ship.
++    init = Path(this_dir) / "ssdi8" / "__init__.py"
++    version_match = re.search(r"^__version__\s*=\s*(.*)$", init.read_text(), re.MULTILINE) if init.exists() else None
++    public_version = ast.literal_eval(version_match.group(1)) if version_match else "0.1.0"
+     local_version = os.environ.get("Q_MAMBA_LOCAL_VERSION")
+     if local_version:
+         return f"{public_version}+{local_version}"
 diff --git a/ssdi8/eval_utils/ppl_eval.py b/ssdi8/eval_utils/ppl_eval.py
 index a714116..8ff8ba6 100644
 --- a/ssdi8/eval_utils/ppl_eval.py
