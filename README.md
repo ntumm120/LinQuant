@@ -43,7 +43,7 @@ cd libs/SSDi8 && pip install . --no-build-isolation && cd ../..          # SSDi8
 cd csrc/marlin_qqq && python setup.py build_ext --inplace && cd ../..    # Marlin W4A8 GEMM (sm80 / sm86 / sm90)
 ```
 
-nvcc needs a host gcc it supports (CUDA 12.8: gcc <= 13). If your environment's default `gcc` is newer (conda-forge ships gcc 14), point both builds at a system compiler: `CC=/usr/bin/gcc CXX=/usr/bin/g++ python setup.py build_ext --inplace`. Model weights and datasets (WikiText-2, the Pile-uncopyrighted validation shard) are fetched from the Hugging Face Hub.
+`causal-conv1d` and `mamba-ssm` compile against the installed torch; if pip's isolated build environment pulls a torch built for a different CUDA version (the error names a CUDA mismatch), install the two first with `pip install --no-build-isolation causal-conv1d==1.5.3.post1 mamba-ssm==2.2.6.post3` (needs `ninja` and `packaging`). nvcc needs a host gcc it supports (CUDA 12.8: gcc <= 13). If your environment's default `gcc` is newer (conda-forge ships gcc 14), point both builds at a system compiler: `CC=/usr/bin/gcc CXX=/usr/bin/g++ python setup.py build_ext --inplace`. Model weights and datasets (WikiText-2, the Pile-uncopyrighted validation shard) are fetched from the Hugging Face Hub.
 
 `python -m pytest tests/` checks the INT8 zoo kernels against `reference.py` and the invariances themselves; it needs no model weights.
 
