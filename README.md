@@ -27,10 +27,11 @@ csrc/marlin_qqq       Marlin QQQ W4A8 GEMM (from vLLM), built as a standalone ex
 
 Tested with Python 3.11, CUDA 12.8, torch 2.8.0, triton 3.4.0 on H100 (perplexity) and A5000 (timing).
 
-Clone with submodules and apply our patch to SSDi8 (calibration hooks for the rotation and key rescaling, the Marlin W4A8 projections, an H100 build fix, and one numerical fix described under [Notes](#notes)):
+Clone, fetch the SSDi8 submodule (without its own nested submodules, which the build does not need), and apply our patch to it (calibration hooks for the rotation and key rescaling, the Marlin W4A8 projections, an H100 build fix, and one numerical fix described under [Notes](#notes)):
 
 ```bash
-git clone --recursive https://github.com/ntumm120/LinQuant.git && cd LinQuant
+git clone https://github.com/ntumm120/LinQuant.git && cd LinQuant
+git submodule update --init libs/SSDi8
 git -C libs/SSDi8 apply ../../patches/ssdi8.patch
 ```
 
