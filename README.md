@@ -39,7 +39,7 @@ git -C libs/SSDi8 apply ../../patches/ssdi8.patch
 Install the package and build the CUDA extensions (the PyPI source package of fast-hadamard-transform is incomplete, so it is built from the submodule):
 
 ```bash
-pip install -e .                                                         # pins torch, triton, fla-core, mamba-ssm, causal-conv1d, transformers
+pip install -e . matplotlib                                              # pins torch, triton, fla-core, mamba-ssm, causal-conv1d, transformers; SSDi8 imports matplotlib
 pip install --no-build-isolation libs/SSDi8/3rdparty/fast-hadamard-transform
 cd libs/SSDi8 && pip install . --no-build-isolation && cd ../..          # SSDi8 extensions (quant_linear_cuda, quant_hadamard, ...)
 cd csrc/marlin_qqq && python setup.py build_ext --inplace && cd ../..    # Marlin W4A8 GEMM (sm80 / sm86 / sm90)
